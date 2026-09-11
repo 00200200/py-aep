@@ -50,7 +50,7 @@ from .ai_layers import (
     UnsupportedAiLayersError,
     _object_offsets,
     _parse_object_at,
-    read_ai_layers,
+    read_ai_layer_ocgs,
 )
 
 if TYPE_CHECKING:
@@ -1162,17 +1162,16 @@ def read_ai_layer_bounds(
     path = Path(file)
     if data is None:
         data = path.read_bytes()
-    names = read_ai_layers(path, data)
+    layers = read_ai_layer_ocgs(path, data)
     doc = _Document(data, path.name)
     page = doc.first_page()
     measurer = _Measurer(doc)
     measurer.run(doc.page_content(page), doc.get(page, "Resources"))
-    # `read_ai_layers` walks the same `/OCGs` array, so the nth name and the
-    # nth reference line up.
-    order = _ocg_numbers(doc, len(names))
     return [
-        measurer.boxes[number].box() if number in measurer.boxes else None
-        for number in order
+        measurer.boxes[layer.object_number].box()
+        if layer.object_number in measurer.boxes
+        else None
+        for layer in layers
     ]
 
 
@@ -1192,19 +1191,3 @@ def footage_size(box: Box | None) -> tuple[int, int]:
         max(1, math.ceil((x1 - x0) / 65536.0)),
         max(1, math.ceil((y1 - y0) / 65536.0)),
     )
-
-
-def _ocg_numbers(doc: _Document, expected: int) -> list[int]:
-    """The object numbers of the catalog's `/OCGs` array, in document order."""
-    properties = doc.get(doc.catalog(), "OCProperties")
-    if properties is None:  # pragma: no cover - read_ai_layers already checked
-        raise doc.reject("no optional content groups")
-    ocgs = doc.get(properties, "OCGs")
-    numbers = [
-        entry.object_number
-        for entry in (ocgs if isinstance(ocgs, list) else [])
-        if isinstance(entry, IndirectReference)
-    ]
-    if len(numbers) != expected:  # pragma: no cover - defensive
-        raise doc.reject("the optional content groups could not be enumerated")
-    return numbers

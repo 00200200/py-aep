@@ -40,7 +40,7 @@ from ...data.file_formats import (
     get_file_format,
 )
 from ...resolvers.ai_bounds import EMPTY_BOX, footage_size, read_ai_layer_bounds
-from ...resolvers.ai_layers import read_ai_color_info, read_ai_color_profile
+from ...resolvers.ai_layers import read_ai_color_profile
 from ...resolvers.media_probe import probe_media
 from ...resolvers.psd_styles import has_enabled_styles
 from ...resolvers.source_layers import resolve_ai_layer, resolve_psd_layer
@@ -660,8 +660,9 @@ class FileSource(FootageSource):
             data = path.read_bytes()
             info = probe_media(path, data)
             fmt = get_file_format(suffix)
-            index, layer_name = resolve_ai_layer(path, layer_index, data)
-            color_space, profile_name = read_ai_color_info(path, data)
+            ai_layers, index = resolve_ai_layer(path, layer_index, data)
+            ai_layer = ai_layers[index]
+            profile_name = read_ai_color_profile(path, data)
             artwork_bounds = None
             width, height = info.width, info.height
             if dimensions == "layer":
@@ -674,9 +675,10 @@ class FileSource(FootageSource):
             opti_data = build_ai_layer_opti_data(
                 info.width,
                 info.height,
-                layer_name,
-                color_space,
+                ai_layer.name,
+                len(ai_layers),
                 artwork_bounds,
+                ai_layer.visible,
             )
             return cls._new(
                 path,
@@ -692,7 +694,7 @@ class FileSource(FootageSource):
                 opti_data=opti_data,
                 embedded_profile_name=profile_name,
                 full_frame=dimensions != "layer",
-                layer_name=layer_name,
+                layer_name=ai_layer.name,
                 layer_index=index,
                 data_size=len(data),
                 reserved_c8=b"\x00\x02",
@@ -960,10 +962,12 @@ class FileSource(FootageSource):
         psd_layer = getattr(self._opti, "psd_group_name", "")
         if psd_layer:
             return str(psd_layer)
-        # AI/EPS/PDF: a `TEXT` opti carries the per-layer-reference flag
-        # and the layer name as typed `TextOptiChunk` fields (0x3D, 0x44).
+        # AI/EPS/PDF: a `TEXT` opti carries the layer name as a typed
+        # `TextOptiChunk` field (0x44). The name alone marks the binding -
+        # the 0x3D byte next to it is the layer's visibility, and AE writes
+        # it 0 for a hidden layer's (still layer-bound) footage.
         opti = self._opti
-        if isinstance(opti, TextOptiChunk) and opti.text_layer_reference:
+        if isinstance(opti, TextOptiChunk):
             return opti.text_layer_name
         return ""
 

@@ -137,7 +137,12 @@ class KeyframeEase:
 
     @influence.setter
     def influence(self, value: float) -> None:
-        _validate_number(min=0.1, max=100.0)(value)
+        # 0.1 is the minimum AE's *dialog* accepts, not the field's range:
+        # separating a dimension-separated Position writes `1/dt` percent
+        # per side, which is 0.0833 for a 12 s segment (measured on AE
+        # 2026). Bounding by the UI limit would reject a value AE itself
+        # stores, so this bounds by what the f8 field can mean instead.
+        _validate_number(min=0.0, max=100.0)(value)
         if self._kf_data is None:
             self._influence = value
             return

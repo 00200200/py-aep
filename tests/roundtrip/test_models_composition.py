@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 from pathlib import Path
+from typing import Iterator
 
 import pytest
 from helpers import (
@@ -14,6 +15,8 @@ from helpers import (
 from py_aep import AdvancedRendererOptions
 from py_aep import parse as parse_aep
 from py_aep.enums import GuideOrientationType, ShadowMapResolution
+from py_aep.models.items.composition import CompItem
+from py_aep.models.properties.property import Property
 
 SAMPLES_DIR = Path(__file__).parent.parent.parent / "samples" / "models" / "composition"
 LAYER_SAMPLES_DIR = Path(__file__).parent.parent.parent / "samples" / "models" / "layer"
@@ -1104,3 +1107,200 @@ class TestRoundtripEssentialGraphics:
         comp.motion_graphics_template_name = "Created Template"
         assert comp.motion_graphics_template_name == "Created Template"
         assert comp.motion_graphics_template_controller_count == 0
+
+
+class TestRoundtripFrameRateRetiming:
+    """Retiming behaviour of CompItem.frame_rate.
+
+    After Effects keeps keyframe times fixed in SECONDS across a frame-rate
+    change, storing them as an integer count of `internal_timebase` units
+    (`seconds = time_units / internal_timebase`). Every expected value below
+    was measured on AE 2026.
+    """
+
+    PROPERTY_SAMPLES_DIR = (
+        Path(__file__).parent.parent.parent / "samples" / "models" / "property"
+    )
+    MARKER_SAMPLES_DIR = (
+        Path(__file__).parent.parent.parent / "samples" / "models" / "marker"
+    )
+
+    @staticmethod
+    def _keyed(comp: CompItem) -> Iterator[Property]:
+        return (prop for prop in comp._walk_properties() if prop.keyframes)
+
+    @staticmethod
+    def _layer_marker(comp: CompItem) -> Property:
+        return next(
+            child
+            for layer in comp.layers
+            for child in layer
+            if getattr(child, "match_name", "") == "ADBE Marker"
+        )
+
+    def test_keyframe_times_hold_in_seconds(self, tmp_path: Path) -> None:
+        """24 -> 30 fps must not move any keyframe. Before the fix these
+        drifted to [0, 2.4, 4.8, 7.2]: the frame indices were preserved
+        instead of the times."""
+        project = parse_project_fresh(self.PROPERTY_SAMPLES_DIR / "keyframe_misc.aep")
+        comp = project.compositions[0]
+        before = {
+            p.match_name: [k.time for k in p.keyframes] for p in self._keyed(comp)
+        }
+        assert before["ADBE Scale"] == [0.0, 3.0, 6.0, 9.0]
+
+        comp.frame_rate = 30.0
+        out = tmp_path / "modified.aep"
+        project.save(out)
+
+        comp2 = parse_aep(out).project.compositions[0]
+        after = {
+            p.match_name: [k.time for k in p.keyframes] for p in self._keyed(comp2)
+        }
+        assert comp2.frame_rate == 30.0
+        assert after == before
+
+    def test_time_units_rescale_by_timebase_ratio(self, tmp_path: Path) -> None:
+        """25 -> 30 moves internal_timebase 25600 -> 30720, so every stored
+        unit count scales by 1.2."""
+        project = parse_project_fresh(
+            self.PROPERTY_SAMPLES_DIR / "effect_point_speed.aep"
+        )
+        comp = project.compositions[0]
+        assert comp.frame_rate == 25.0
+        assert comp._cdta.internal_timebase == 25600
+        before = {
+            p.match_name: [k._ldat_item.time_units for k in p.keyframes]
+            for p in self._keyed(comp)
+        }
+
+        comp.frame_rate = 30.0
+        out = tmp_path / "modified.aep"
+        project.save(out)
+
+        comp2 = parse_aep(out).project.compositions[0]
+        assert comp2._cdta.internal_timebase == 30720
+        for prop in self._keyed(comp2):
+            expected = [round(u * 30720 / 25600) for u in before[prop.match_name]]
+            assert [k._ldat_item.time_units for k in prop.keyframes] == expected
+
+    def test_no_rescale_when_only_time_scale_moves(self, tmp_path: Path) -> None:
+        """30 -> 60 keeps internal_timebase at 30720 and halves time_scale, so
+        the stored unit counts must NOT change. The seconds must not drift
+        either, which needs the cached conversion factors refreshed."""
+        project = parse_project_fresh(self.PROPERTY_SAMPLES_DIR / "keyframe_misc.aep")
+        comp = project.compositions[0]
+        comp.frame_rate = 30.0
+        units_at_30 = {
+            p.match_name: [k._ldat_item.time_units for k in p.keyframes]
+            for p in self._keyed(comp)
+        }
+        seconds_at_30 = {
+            p.match_name: [k.time for k in p.keyframes] for p in self._keyed(comp)
+        }
+
+        comp.frame_rate = 60.0
+        out = tmp_path / "modified.aep"
+        project.save(out)
+
+        comp2 = parse_aep(out).project.compositions[0]
+        assert comp2._cdta.internal_timebase == 30720
+        assert comp2.time_scale == 2.0
+        for prop in self._keyed(comp2):
+            name = prop.match_name
+            assert [k._ldat_item.time_units for k in prop.keyframes] == units_at_30[
+                name
+            ]
+            assert [k.time for k in prop.keyframes] == seconds_at_30[name]
+
+    def test_tdb4_time_base_is_restamped(self, tmp_path: Path) -> None:
+        """AE writes cdta.internal_timebase into every property tdb4 and
+        rejects the file when the copy is wrong."""
+        project = parse_project_fresh(self.PROPERTY_SAMPLES_DIR / "keyframe_misc.aep")
+        comp = project.compositions[0]
+        comp.frame_rate = 30.0
+        out = tmp_path / "modified.aep"
+        project.save(out)
+
+        comp2 = parse_aep(out).project.compositions[0]
+        timebase = comp2._cdta.internal_timebase
+        assert timebase == 30720
+        stamps = {
+            p._tdb4._time_base
+            for p in comp2._walk_properties()
+            if p._tdb4 is not None and p._is_live()
+        }
+        assert stamps == {timebase}
+
+    def test_duration_requantizes_by_rounding(self, tmp_path: Path) -> None:
+        """A 253-frame 24 fps comp is 263.54 frames at 25 fps. AE rounds to
+        264 (10.56 s); truncating would give 263 (10.52 s)."""
+        project = parse_project_fresh(self.PROPERTY_SAMPLES_DIR / "keyframe_misc.aep")
+        comp = project.compositions[0]
+        comp.duration = 253.0 / 24.0
+
+        comp.frame_rate = 25.0
+        out = tmp_path / "modified.aep"
+        project.save(out)
+
+        comp2 = parse_aep(out).project.compositions[0]
+        assert comp2.duration == pytest.approx(10.56)
+        assert round(comp2.duration * 25.0) == 264
+
+    @pytest.mark.parametrize("sample", ["comp_marker.aep", "layer_marker.aep"])
+    def test_marker_times_hold_in_seconds(self, sample: str, tmp_path: Path) -> None:
+        """Markers are keyframes on a marker property, so they ride the same
+        rescale, on the comp and on the layer alike."""
+        on_comp = sample.startswith("comp")
+        project = parse_project_fresh(self.MARKER_SAMPLES_DIR / sample)
+        comp = project.compositions[0]
+        marker = comp.marker_property if on_comp else self._layer_marker(comp)
+        assert marker is not None
+        marker.keyframes[0].time = 3.0
+
+        comp.frame_rate = 30.0
+        out = tmp_path / "modified.aep"
+        project.save(out)
+
+        comp2 = parse_aep(out).project.compositions[0]
+        marker2 = comp2.marker_property if on_comp else self._layer_marker(comp2)
+        assert marker2 is not None
+        assert marker2.keyframes[0].time == 3.0
+
+    def test_nested_comp_is_untouched(self, tmp_path: Path) -> None:
+        """Changing the outer frame rate leaves a precomp source alone: its
+        own rate, duration and timebase all hold."""
+        project = parse_project_fresh(SAMPLES_DIR / "duplicate.aep")
+        outer = get_comp(project, "DupSrc")
+        inner = get_comp(project, "Inner")
+        before = (inner.frame_rate, inner.duration, inner._cdta.internal_timebase)
+
+        outer.frame_rate = 60.0
+        out = tmp_path / "modified.aep"
+        project.save(out)
+
+        inner2 = get_comp(parse_aep(out).project, "Inner")
+        assert (
+            inner2.frame_rate,
+            inner2.duration,
+            inner2._cdta.internal_timebase,
+        ) == before
+
+    def test_noop_write_changes_nothing(self) -> None:
+        """Writing the frame rate a comp already has must not retime it, or
+        tooling that echoes values back would requantize timings that are
+        legitimately off-grid."""
+        project = parse_project_fresh(self.PROPERTY_SAMPLES_DIR / "keyframe_misc.aep")
+        comp = project.compositions[0]
+        comp.duration = 253.0 / 24.0
+        before_duration = comp.duration
+        before_units = [
+            k._ldat_item.time_units for p in self._keyed(comp) for k in p.keyframes
+        ]
+
+        comp.frame_rate = comp.frame_rate
+
+        assert comp.duration == before_duration
+        assert [
+            k._ldat_item.time_units for p in self._keyed(comp) for k in p.keyframes
+        ] == before_units

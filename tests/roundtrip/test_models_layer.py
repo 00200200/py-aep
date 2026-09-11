@@ -19,6 +19,7 @@ from py_aep.enums import (
     AutoOrientType,
     BlendingMode,
     FrameBlendingType,
+    KeyframeInterpolationType,
     Label,
     LayerQuality,
     LayerSamplingQuality,
@@ -1668,3 +1669,63 @@ class TestForwardRayOnly:
         layer.transform["ADBE Position"].value = [960.0, 540.0, -20000.0]
         with pytest.raises(ValueError, match="not in front of the camera"):
             layer.comp_point_to_source([100.0, 100.0])
+
+
+class TestRoundtripTimeRemapRamp:
+    """Enabling time remapping seeds AE's two-keyframe identity ramp.
+
+    AE writes exactly two LINEAR keyframes spanning the source from the
+    layer's START (not its in point): `(start_time, 0)` and
+    `(start_time + source.duration, source.duration)`. Measured on AE 2026
+    for comp and footage sources and for a layer offset in time; the single
+    keyframe py-aep used to write left the remap frozen on one value.
+    """
+
+    def test_matches_the_ae_authored_ramp(self, tmp_path: Path) -> None:
+        """`outPoint_no_clamp.aep` carries AE's own ramp for a 5 s source:
+        disabling and re-enabling must reproduce it."""
+        project = parse_project_fresh(SAMPLES_DIR / "outPoint_no_clamp.aep")
+        comp = get_comp(project, "outPoint_no_clamp_timeRemap")
+        layer = comp.layers[0]
+        assert isinstance(layer, AVLayer)
+        authored = [(k.time, k.value) for k in layer["ADBE Time Remapping"].keyframes]
+        assert authored == [(0.0, 0.0), (5.0, 5.0)]
+
+        layer.time_remap_enabled = False
+        layer.time_remap_enabled = True
+
+        out = tmp_path / "modified.aep"
+        project.save(out)
+        comp2 = get_comp(parse_aep(out).project, "outPoint_no_clamp_timeRemap")
+        remap = comp2.layers[0]["ADBE Time Remapping"]
+        assert [(k.time, k.value) for k in remap.keyframes] == authored
+
+    def test_ramp_is_linear(self, tmp_path: Path) -> None:
+        project = parse_project_fresh(SAMPLES_DIR / "outPoint_no_clamp.aep")
+        layer = get_comp(project, "outPoint_no_clamp_timeRemap").layers[0]
+        assert isinstance(layer, AVLayer)
+        layer.time_remap_enabled = False
+        layer.time_remap_enabled = True
+
+        out = tmp_path / "modified.aep"
+        project.save(out)
+        comp2 = get_comp(parse_aep(out).project, "outPoint_no_clamp_timeRemap")
+        for keyframe in comp2.layers[0]["ADBE Time Remapping"].keyframes:
+            assert keyframe.in_interpolation_type == KeyframeInterpolationType.LINEAR
+            assert keyframe.out_interpolation_type == KeyframeInterpolationType.LINEAR
+
+    def test_ramp_starts_at_the_layer_start_not_the_in_point(self) -> None:
+        """AE anchors the ramp to `start_time`; an in point trimmed later
+        does not move it."""
+        project = parse_project_fresh(SAMPLES_DIR / "outPoint_no_clamp.aep")
+        layer = get_comp(project, "outPoint_no_clamp_timeRemap").layers[0]
+        assert isinstance(layer, AVLayer)
+        layer.time_remap_enabled = False
+        layer.start_time = 2.0
+        layer.in_point = 3.0
+        layer.time_remap_enabled = True
+
+        source = layer.source
+        assert source is not None
+        times = [k.time for k in layer["ADBE Time Remapping"].keyframes]
+        assert times == pytest.approx([2.0, 2.0 + source.duration])

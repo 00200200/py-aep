@@ -39,6 +39,12 @@ class CameraLayer(Layer):
     # (2 * tan(fov/2) rounds to 0.72; AE uses the exact ratio).
     _zoom_dividend: float = 0.72
 
+    @property
+    def is_3d(self) -> bool:
+        """Always `True`: a camera / light layer only exists in 3D space.
+        Read-only."""
+        return True
+
     @classmethod
     def _new(  # type: ignore[override]
         cls,

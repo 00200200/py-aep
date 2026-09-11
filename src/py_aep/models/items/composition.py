@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import uuid
-from typing import TYPE_CHECKING, Any, List, Mapping, cast
+from typing import TYPE_CHECKING, Any, Iterator, List, Mapping, cast
 
 from ...ae_version import requires_version
 from ...binary.chunk import Chunk, DeferredListChunk, ListChunk
@@ -441,8 +441,109 @@ class CompItem(AVItem):
     Samples Per Frame setting in the Advanced tab of the Composition
     Settings dialog box. Read / Write."""
 
-    frame_rate = ChunkField[float]("_cdta", "frame_rate", validate=validate_frame_rate)
-    """The frame rate of the item in frames-per-second. Read / Write."""
+    @property
+    def frame_rate(self) -> float:
+        """The frame rate of the item in frames-per-second. Read / Write.
+
+        Writing also rewrites the composition's internal timebase, and with
+        it every keyframe time in the composition. After Effects keeps
+        keyframe times fixed in *seconds* across a frame-rate change and
+        stores them as an integer count of `internal_timebase` units, so the
+        stored counts are rescaled to match. Composition duration and work
+        area are requantized onto the new frame grid; layer timing and
+        nested compositions are left untouched.
+        """
+        return cast("float", self._cdta.frame_rate)
+
+    @frame_rate.setter
+    def frame_rate(self, value: float) -> None:
+        validate_frame_rate(value)
+        cdta = self._cdta
+        if cdta.frame_rate == value:
+            # A no-op write must stay a no-op: retiming an already-consistent
+            # comp would requantize timings that are legitimately off-grid.
+            return
+        old_timebase = cdta.internal_timebase
+        # Writing frame_rate also rewrites internal_timebase and time_scale
+        # (CdtaChunk._update_timebase), so capture the old base first.
+        cdta.frame_rate = value
+        self._retime_to_timebase(old_timebase, cdta.internal_timebase)
+        self._requantize_comp_timing(value)
+
+    def _walk_properties(self) -> Iterator[Property]:
+        """Every `Property` under this comp's layers, plus its markers.
+
+        Deliberately does not descend into a precomp layer's source item:
+        changing this composition's frame rate leaves nested compositions
+        alone (measured on AE 2026).
+        """
+
+        def walk(group: PropertyGroup) -> Iterator[Property]:
+            for child in group:
+                if isinstance(child, PropertyGroup):
+                    yield from walk(child)
+                elif isinstance(child, Property):
+                    yield child
+
+        for layer in self.layers:
+            yield from walk(layer)
+        if self._marker_property is not None:
+            yield self._marker_property
+
+    def _retime_to_timebase(self, old: int, new: int) -> None:
+        """Rescale keyframe times and restamp per-property timebases.
+
+        `seconds = time_units / internal_timebase`, so holding a keyframe at
+        the same time in seconds means scaling its stored unit count by
+        `new / old`. That ratio is 1 whenever only `time_scale` moved - the
+        whole NTSC family, and 30 <-> 60 - but the cached conversion factors
+        on each `Keyframe` still have to be refreshed, because `frame_time`
+        is derived from `time_scale`.
+
+        Every property's `tdb4` also carries the comp's timebase, and AE
+        rejects a file whose copy is wrong ("zero denominator converting
+        ratio denominators").
+        """
+        rescale = new != old and old > 0
+        time_scale = self.time_scale
+        frame_rate = self._cdta.frame_rate
+        for prop in self._walk_properties():
+            if prop._is_live():
+                prop._ensure_time_base()
+            for keyframe in prop.keyframes:
+                if rescale:
+                    item = keyframe._ldat_item
+                    item.time_units = round(item.time_units * new / old)
+                keyframe._time_scale = time_scale
+                keyframe._frame_rate = frame_rate
+
+    def _requantize_comp_timing(self, frame_rate: float) -> None:
+        """Snap comp duration and work area onto the new frame grid.
+
+        AE rounds rather than truncates: a 253-frame 24 fps comp becomes 264
+        frames at 25 fps, where truncation would give 263. Layer in / out /
+        start times are not requantized.
+        """
+        cdta = self._cdta
+
+        def on_grid(seconds: float) -> float:
+            return round(seconds * frame_rate) / frame_rate
+
+        # 0xFFFFFFFF means "the work area runs to the end of the comp": that
+        # end already follows `duration`, and writing a duration would pin it
+        # to a fixed one. The START is stored either way, so it is snapped
+        # either way.
+        end_is_pinned = cdta.work_area_end_dividend != 0xFFFFFFFF
+        work_area_start = cdta.work_area_start
+        work_area_duration = cdta.work_area_duration
+
+        cdta.duration = on_grid(cdta.duration)
+        cdta.work_area_start = on_grid(work_area_start)
+        if not end_is_pinned:
+            return
+        cdta.work_area_duration = max(
+            0.0, min(on_grid(work_area_duration), cdta.duration - cdta.work_area_start)
+        )
 
     duration = ChunkField[float]("_cdta", "duration", validate=validate_duration)
     """The duration of the item in seconds. Read / Write."""

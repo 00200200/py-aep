@@ -192,7 +192,10 @@ def tdb4_apply_animated_template(t: Tdb4Chunk, *, color: bool, spatial: bool) ->
     t.animated = True
     t._cvot_flags = 0xFF
     t._value_hint_flag = 0xFF
-    t._time_base = 0x6000
+    # Do NOT set _time_base here: it is the containing comp's
+    # internal_timebase, which this layer cannot know. The caller stamps it
+    # (Property._ensure_time_base). Hard-coding 24576 here wrote a 24 fps
+    # timebase into every animated property of every non-24 fps comp.
     if color:
         t._property_category = 0x01
         t._value_hint_type = 2

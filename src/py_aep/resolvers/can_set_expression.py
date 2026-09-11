@@ -79,7 +79,18 @@ def resolve_can_set_expression(prop: Property) -> bool:
     """
     mn = prop.match_name
 
+    # Separation moves expressibility from the leader to its followers.
+    # Measured on AE 2026: unseparated, the leader takes an expression and no
+    # follower does; separated, the leader refuses one and X / Y accept, with
+    # Z joining them only on a 3D layer.
     if prop.is_separation_follower:
+        leader = prop.separation_leader
+        if leader is None or not leader.dimensions_separated:
+            return False
+        if prop.separation_dimension == 2:
+            return prop._containing_layer.is_3d
+        return True
+    if prop.is_separation_leader and prop.dimensions_separated:
         return False
 
     # An UNAPPLIED text-animator pool property cannot have an expression;

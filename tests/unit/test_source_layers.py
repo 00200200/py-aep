@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from py_aep import list_layers
+from py_aep.resolvers.ai_layers import AiLayer
 from py_aep.resolvers.psd_layers import FlattenedPsdError
 from py_aep.resolvers.source_layers import (
     psd_leaf_layers,
@@ -117,8 +118,9 @@ class TestResolveAiLayer:
     def test_resolves_document_index_and_name(self) -> None:
         # Dropdown order is top-first; the document (OCG) order it maps to
         # is bottom-first.
-        assert resolve_ai_layer(ASSETS / "ai.ai", 0) == (1, "Calque 2")
-        assert resolve_ai_layer(ASSETS / "ai.ai", 1) == (0, "Calque 1")
+        layers = [AiLayer(35, "Calque 1", True), AiLayer(36, "Calque 2", True)]
+        assert resolve_ai_layer(ASSETS / "ai.ai", 0) == (layers, 1)
+        assert resolve_ai_layer(ASSETS / "ai.ai", 1) == (layers, 0)
 
     def test_out_of_range_raises(self) -> None:
         with pytest.raises(ValueError, match="layer_index 2 out of range"):

@@ -16,7 +16,10 @@ from ...parsers.utils import get_match_name_runs
 from ...resolvers.transform import (
     Mat4,
     build_world_matrix,
+    compose_orientation,
     decompose_transform,
+    rotation_part,
+    strip_orientation,
 )
 from ..descriptors import ChunkField
 from ..naming import auto_name
@@ -32,6 +35,7 @@ from ..validators import (
 if TYPE_CHECKING:
     from ...binary.layer_chunks import LdtaChunk
     from ..items.composition import CompItem
+    from ..properties.keyframe import Keyframe
     from ..properties.marker import MarkerValue
 
 
@@ -317,6 +321,16 @@ class Layer(PropertyGroup):
         return self._containing_comp.frame_time
 
     @property
+    def is_3d(self) -> bool:
+        """Whether the layer transforms in three dimensions.
+
+        `False` on the base [Layer][]: only an [AVLayer][] carries the
+        3D switch, and cameras and lights are always 3D, so both override
+        this. Read-only.
+        """
+        return False
+
+    @property
     def _stretch_factor(self) -> float:
         stretch = self.stretch
         return stretch / 100.0 if stretch != 0.0 else 1.0
@@ -576,14 +590,18 @@ class Layer(PropertyGroup):
         if old_parent is new_parent:
             return
 
-        child_world = build_world_matrix(self)
+        # A 2D child cannot store an out-of-plane rotation, and AE does not
+        # try: it compensates as though every ancestor were 2D. Building the
+        # matrices the same way keeps our answer on AE's.
+        is_3d = self.is_3d
+        child_world = build_world_matrix(self, flatten_2d=not is_3d)
         old_parent_world = (
-            build_world_matrix(old_parent)
+            build_world_matrix(old_parent, flatten_2d=not is_3d)
             if old_parent is not None
             else Mat4.identity()
         )
         new_parent_world = (
-            build_world_matrix(new_parent)
+            build_world_matrix(new_parent, flatten_2d=not is_3d)
             if new_parent is not None
             else Mat4.identity()
         )
@@ -597,11 +615,26 @@ class Layer(PropertyGroup):
             "list[float]", cast("Property", self.transform["ADBE Anchor Point"]).value
         )
 
-        new_pos, new_scale, new_rz, new_rx, new_ry = decompose_transform(
-            new_local, anchor
-        )
-
         transform = self.transform
+
+        # Position and scale come straight from the local matrix - neither
+        # depends on how the rotation is split between Orientation and
+        # Rotate X/Y/Z. `new_rz` is only used on the 2D path below, where the
+        # orientation is divided out of the 3x3 first so it cannot leak into
+        # the rotation (a layer switched from 3D to 2D can still carry one).
+        orientation = cast(
+            "list[float]", cast("Property", transform["ADBE Orientation"]).value
+        )
+        new_pos = decompose_transform(new_local, anchor)[0]
+        _, new_scale, new_rz, _, _ = decompose_transform(
+            strip_orientation(new_local, orientation), anchor
+        )
+        if new_scale[0] < 0:
+            # `decompose_transform` signals a mirrored basis by negating x
+            # alone. AE spreads the flip across all three axes and keeps the
+            # rotation proper: a parent scaled [-100, 100, 100] leaves the
+            # child at [-100, -100, -100] with Orientation [180, 0, 0].
+            new_scale = [-abs(component) for component in new_scale]
 
         def write_compensation(match_name: str, new_value: Any) -> None:
             # Only write values that actually changed to avoid materializing
@@ -614,11 +647,71 @@ class Layer(PropertyGroup):
             if prop.value != new_value:
                 prop.value = new_value
 
+        def remap_separated_keyframes(
+            leader: Property, followers: list[Property]
+        ) -> None:
+            """Remap an animated separated Position into the new parent's space.
+
+            A separated leader holds no keyframes of its own, so the generic
+            keyframe branch below never sees this case. Each follower
+            keyframe is remapped through the leader's composed position at
+            its own time, because the transform mixes the axes.
+            """
+            remap = new_parent_world.inverse() @ old_parent_world
+            # Collected first, applied after: every sample has to see the
+            # pre-remap followers, and a component write would move them.
+            updates: list[tuple[Keyframe, float]] = []
+            remapped: dict[float, list[float]] = {}
+            for dimension, follower in enumerate(followers):
+                for keyframe in follower.keyframes:
+                    point = remapped.get(keyframe.time)
+                    if point is None:
+                        point = remapped[keyframe.time] = remap.transform_point(
+                            cast("list[float]", leader.value_at_time(keyframe.time))
+                        )
+                    updates.append((keyframe, point[dimension]))
+            for keyframe, component in updates:
+                keyframe.value = component
+
+        # AE remaps a keyframed Scale rather than leaving it: under a parent
+        # scaled to 50% each key doubles, and under one scaled
+        # [200, 50, 100] each key is divided per axis. Skipping them left
+        # the layer 25 px out at one time and 62 px at another.
+        scale_prop = cast("Property", transform["ADBE Scale"])
+        if scale_prop.keyframes:
+            current = cast("list[float]", scale_prop.value)
+            factors = [
+                new_scale[axis] / current[axis]
+                if axis < len(current) and current[axis]
+                else 1.0
+                for axis in range(len(new_scale))
+            ]
+            # Skipped when the parent applies no scale, for the reason
+            # `write_compensation` gives: an unchanged value is not written.
+            if any(factor != 1.0 for factor in factors):
+                for keyframe in scale_prop.keyframes:
+                    components = cast("list[float]", keyframe.value)
+                    keyframe.value = [
+                        component * factors[axis] if axis < len(factors) else component
+                        for axis, component in enumerate(components)
+                    ]
+        else:
+            write_compensation("ADBE Scale", new_scale)
+
         # ExtendScript remaps every POSITION keyframe into the new parent's
-        # space (measured in AE 2026); other keyframed properties keep
-        # their values.
+        # space (measured in AE 2026).
         pos = cast("Property", transform["ADBE Position"])
-        if pos.keyframes:
+        separated = pos._separation_followers()
+        if separated is not None:
+            # AE refuses `setValue` on a separated leader, but compensates
+            # the followers itself on a reparent (measured on AE 2026: a
+            # separated child at (150, 160) under a parent at (300, 40)
+            # becomes X = -150, Y = 120), so go through them directly.
+            if any(follower.keyframes for follower in separated):
+                remap_separated_keyframes(pos, separated)
+            else:
+                pos._set_separated_value(new_pos, separated)
+        elif pos.keyframes:
             remap = new_parent_world.inverse() @ old_parent_world
             for kf in pos.keyframes:
                 kf_value = cast("list[float]", kf.value)
@@ -634,14 +727,50 @@ class Layer(PropertyGroup):
                         )
         else:
             write_compensation("ADBE Position", new_pos)
-        write_compensation("ADBE Scale", new_scale)
-        write_compensation("ADBE Rotate Z", new_rz)
 
-        # Only update 3D rotation properties if the layer is 3D.
-        is_3d = getattr(self, "three_d_layer", False)
-        if is_3d:
-            write_compensation("ADBE Rotate X", new_rx)
-            write_compensation("ADBE Rotate Y", new_ry)
+        rotation_delta = rotation_part(new_parent_world).inverse() @ rotation_part(
+            old_parent_world
+        )
+        if not is_3d:
+            # A 2D layer has no Orientation to use, so AE puts the rotation
+            # into Rotate Z (measured: a 2D child under a 30-degree parent
+            # gets rotZ = -30 and orientation stays [0,0,0]).
+            rotation = cast("Property", transform["ADBE Rotate Z"])
+            if rotation.keyframes:
+                # AE offsets every rotation keyframe rather than giving up on
+                # an animated one - keys of 15 and 75 under a 30-degree
+                # parent became -15 and 45. Skipping them, as
+                # `write_compensation` does, left the layer 35 px out.
+                # As a signed turn, not the 0-360 form `compose_orientation`
+                # returns: AE stores -15 and 45, not 345 and 405.
+                offset = (
+                    compose_orientation([0.0, 0.0, 0.0], rotation_delta)[2] + 180.0
+                ) % 360.0 - 180.0
+                for keyframe in rotation.keyframes:
+                    keyframe.value = cast("float", keyframe.value) + offset
+                return
+            write_compensation("ADBE Rotate Z", new_rz)
+            return
+
+        # A 3D layer is compensated entirely through Orientation:
+        # `O_new = parent_rotation^-1 . O_old`, with Rotate X/Y/Z left
+        # exactly as they were. Verified on AE 2026 over ten cases.
+        #
+        # This is not just a different way to store the same result. Writing
+        # the rotations instead collides with `write_compensation` skipping
+        # keyframed properties: a child with a keyframed Rotate Z would get
+        # its position compensated but not its rotation, and jump by 362 px
+        # in a case where AE does not move it at all.
+        orientation_prop = cast("Property", transform["ADBE Orientation"])
+        if orientation_prop.keyframes:
+            for keyframe in orientation_prop.keyframes:
+                keyframe.value = compose_orientation(
+                    cast("list[float]", keyframe.value), rotation_delta
+                )
+            return
+        rotated = compose_orientation(orientation, rotation_delta)
+        if orientation_prop.value != rotated:
+            orientation_prop.value = rotated
 
     def set_parent_with_jump(self, new_parent: Layer | None) -> None:
         """Sets the parent of this layer to the specified layer, without changing the

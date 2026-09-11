@@ -72,8 +72,8 @@ from ..enums import (
 )
 from ..enums.mappings import adobe_color_profile_names
 from ..resolvers.ai_layers import (
-    read_ai_color_info,
-    read_ai_layers,
+    read_ai_color_profile,
+    read_ai_layer_ocgs,
 )
 from ..resolvers.media_probe import probe_media
 from ..resolvers.psd_layers import (
@@ -1316,6 +1316,8 @@ class Project:
             folder.items.append(footage)
             layer = comp.add(footage)
             layer.name = spec.name
+            if not spec.enabled:
+                layer.enabled = False
             if spec.transform is not None:
                 (anchor_x, anchor_y), (position_x, position_y) = spec.transform
                 transform = layer.transform
@@ -1350,17 +1352,25 @@ class Project:
         # the same bytes.
         data = file.read_bytes()
         info = probe_media(file, data)
-        color_space, profile_name = read_ai_color_info(file, data)
+        profile_name = read_ai_color_profile(file, data)
+        layers = read_ai_layer_ocgs(file, data)
         specs: list[LayerSpec | LayerGroupSpec] = [
             LayerSpec(
-                name,
-                build_ai_layer_opti_data(info.width, info.height, name, color_space),
+                layer.name,
+                build_ai_layer_opti_data(
+                    info.width,
+                    info.height,
+                    layer.name,
+                    len(layers),
+                    visible=layer.visible,
+                ),
                 info.width,
                 info.height,
                 layer_index=index,
                 data_size=len(data),
+                enabled=layer.visible,
             )
-            for index, name in enumerate(read_ai_layers(file, data))
+            for index, layer in enumerate(layers)
         ]
         return self._import_layered_comp(file, "TEXT", specs, info, profile_name)
 

@@ -71,6 +71,11 @@ class LayerSpec(NamedTuple):
     """Set the layer's preserve-transparency switch (a clipped PSD layer
     inside its auto-precomposed clipping run)."""
 
+    enabled: bool = True
+    """The comp layer's video switch. `False` for a source layer the document
+    hides (an Illustrator layer in the file's `/D` `/OFF` array), which AE
+    imports as a layer with its eyeball off."""
+
 
 class LayerGroupSpec(NamedTuple):
     """A layer group, imported as a nested composition of its children.

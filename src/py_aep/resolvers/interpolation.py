@@ -440,72 +440,145 @@ def _tangents_are_zero(tangent: list[float] | None) -> bool:
 # ---------------------------------------------------------------------------
 
 
+_AUTO_BEZIER_CHORD_SCALE = 1.0 / 6.0
+
+
+def auto_spatial_tangents(
+    values: list[list[float]], index: int
+) -> tuple[list[float], list[float]]:
+    """AE's auto-bezier spatial tangents for `values[index]`.
+
+    The tangent is one sixth of the chord between the keyframe's two
+    neighbours, applied symmetrically: `in = -out`. An endpoint uses the
+    chord to its single neighbour, and still gets both tangents. A lone
+    keyframe gets zeros.
+
+    Measured on AE 2018 (a five-key diamond, every tangent matching) and on
+    AE 2026 with deliberately uneven time spacing, which rules out the
+    time-weighted variant this used to implement - that agrees with AE only
+    when the neighbours are equidistant in time.
+
+    The result is expressed in whatever space `values` are in, so callers
+    working in raw chunk units and callers working in resolved units both
+    get a self-consistent answer.
+
+    Returns:
+        An `(out_tangent, in_tangent)` pair.
+    """
+    ndim = len(values[index])
+    zero = [0.0] * ndim
+    if len(values) < 2:
+        return zero, list(zero)
+    low = values[index - 1] if index > 0 else values[index]
+    high = values[index + 1] if index < len(values) - 1 else values[index]
+    out_tangent = [(high[d] - low[d]) * _AUTO_BEZIER_CHORD_SCALE for d in range(ndim)]
+    return out_tangent, [-component for component in out_tangent]
+
+
+def auto_temporal_speeds(
+    values: list[list[float]], times: list[float], index: int
+) -> tuple[list[float], list[float]]:
+    """AE's auto-bezier temporal speeds for `values[index]`, per dimension.
+
+    An interior keyframe takes the through-slope across its neighbours on
+    both sides. An endpoint takes the slope of its single segment on the
+    inward side and zero on the outward side. Influence is always
+    `_DEFAULT_INFLUENCE`.
+
+    Multi-dimensional properties get a per-dimension slope (measured on AE
+    2026: 2-D Scale 100->200->400 / 100->120->150 yields speeds 150 and 25).
+
+    Returns:
+        An `(in_speeds, out_speeds)` pair, one entry per dimension.
+    """
+    ndim = len(values[index])
+    zero = [0.0] * ndim
+    count = len(values)
+    if count < 2:
+        return list(zero), list(zero)
+
+    def slope(lo: int, hi: int) -> list[float]:
+        span = times[hi] - times[lo]
+        if span <= 0:
+            return [0.0] * ndim
+        return [(values[hi][d] - values[lo][d]) / span for d in range(ndim)]
+
+    if index == 0:
+        return list(zero), slope(0, 1)
+    if index == count - 1:
+        return slope(count - 2, count - 1), list(zero)
+    through = slope(index - 1, index + 1)
+    return through, list(through)
+
+
+def roving_keyframe_times(keyframes: list[Keyframe]) -> dict[int, float]:
+    """Times for every roving keyframe, spaced by arc length.
+
+    A roving keyframe's time is derived, not stored: AE places it so the
+    speed along the spatial path is constant between the enclosing
+    non-roving anchors, `t = t_a + (t_b - t_a) * arc_so_far / arc_total`.
+
+    The metric is the length of the actual curve, not the chord between
+    keyframes - measured on AE 2026 with one segment bowed by +/-400 px
+    tangents, where chord length predicts 0.667 s and AE produced 2.2205 s.
+    The 150-sample approximation in `_BezierPathData` reproduces AE's stored
+    times to the exact timebase unit for both that case and a flattened one.
+
+    Returns:
+        A `{keyframe index: time in seconds}` mapping covering only the
+        roving keyframes that sit between two anchors.
+    """
+    result: dict[int, float] = {}
+    anchors = [i for i, kf in enumerate(keyframes) if not kf.roving]
+    if len(anchors) < 2:
+        return result
+
+    for start, end in zip(anchors, anchors[1:]):
+        if end - start < 2:
+            continue
+        lengths: list[float] = []
+        for i in range(start, end):
+            first, second = keyframes[i].value, keyframes[i + 1].value
+            if not isinstance(first, list) or not isinstance(second, list):
+                lengths = []
+                break
+            out_tangent = keyframes[i].out_spatial_tangent or [0.0] * len(first)
+            in_tangent = keyframes[i + 1].in_spatial_tangent or [0.0] * len(second)
+            lengths.append(
+                _BezierPathData(first, second, out_tangent, in_tangent).segment_length
+            )
+        total = sum(lengths)
+        if not lengths or total <= 0:
+            continue
+        span_start, span_end = keyframes[start].time, keyframes[end].time
+        travelled = 0.0
+        for offset, index in enumerate(range(start + 1, end)):
+            travelled += lengths[offset]
+            result[index] = span_start + (span_end - span_start) * travelled / total
+    return result
+
+
 def _compute_auto_spatial_tangents(
     keyframes: list[Keyframe],
 ) -> list[tuple[list[float] | None, list[float] | None]]:
-    """Compute spatial tangents for keyframes with `spatial_auto_bezier`.
+    """Resolve spatial tangents for interpolation, deriving auto-bezier ones.
 
-    Returns a list of (out_tangent, in_tangent) per keyframe.
+    Unlike the old implementation this does NOT defer to the stored tangents
+    when they are non-zero: AE recomputes them from the flag and ignores what
+    is on disk, so its own files legitimately carry stale values.
     """
-    n = len(keyframes)
+    values = [kf.value for kf in keyframes]
+    all_vectors = all(isinstance(value, list) for value in values)
     result: list[tuple[list[float] | None, list[float] | None]] = []
-
-    for i in range(n):
-        kf = keyframes[i]
-        is_auto = kf.spatial_auto_bezier
-        out_tan = kf.out_spatial_tangent
-        in_tan = kf.in_spatial_tangent
-
-        if not is_auto or not isinstance(kf.value, list):
-            result.append((out_tan, in_tan))
+    for i, kf in enumerate(keyframes):
+        value = values[i]
+        if not kf.spatial_auto_bezier or not isinstance(value, list):
+            result.append((kf.out_spatial_tangent, kf.in_spatial_tangent))
             continue
-
-        if not _tangents_are_zero(out_tan) or not _tangents_are_zero(in_tan):
-            result.append((out_tan, in_tan))
+        if not all_vectors:
+            result.append(([0.0] * len(value), [0.0] * len(value)))
             continue
-
-        ndim = len(kf.value)
-
-        if n == 1:
-            result.append(([0.0] * ndim, [0.0] * ndim))
-            continue
-
-        _EP_SCALE = 1.0 / 6.0
-        _INT_SCALE = 1.0 / 3.0
-
-        if i == 0:
-            nxt_val = keyframes[1].value
-            if isinstance(nxt_val, list):
-                out_t = [(nxt_val[d] - kf.value[d]) * _EP_SCALE for d in range(ndim)]
-            else:
-                out_t = [0.0] * ndim
-            result.append((out_t, [0.0] * ndim))
-        elif i == n - 1:
-            prv_val = keyframes[i - 1].value
-            if isinstance(prv_val, list):
-                in_t = [-(kf.value[d] - prv_val[d]) * _EP_SCALE for d in range(ndim)]
-            else:
-                in_t = [0.0] * ndim
-            result.append(([0.0] * ndim, in_t))
-        else:
-            prv = keyframes[i - 1]
-            nxt = keyframes[i + 1]
-            if not isinstance(prv.value, list) or not isinstance(nxt.value, list):
-                result.append(([0.0] * ndim, [0.0] * ndim))
-                continue
-
-            dt_left = kf.time - prv.time
-            dt_right = nxt.time - kf.time
-            dt_sum = dt_left + dt_right
-            if dt_sum < 1e-12:
-                result.append(([0.0] * ndim, [0.0] * ndim))
-                continue
-
-            direction = [nxt.value[d] - prv.value[d] for d in range(ndim)]
-            in_t = [-direction[d] * dt_left / dt_sum * _INT_SCALE for d in range(ndim)]
-            out_t = [direction[d] * dt_right / dt_sum * _INT_SCALE for d in range(ndim)]
-            result.append((out_t, in_t))
-
+        result.append(auto_spatial_tangents(cast("list[list[float]]", values), i))
     return result
 
 

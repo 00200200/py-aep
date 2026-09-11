@@ -26,7 +26,6 @@ from py_aep.models.sources.file import FileSource
 from py_aep.resolvers.ai_layers import (
     UnsupportedAiLayersError,
     read_ai_color_profile,
-    read_ai_color_space,
     read_ai_layers,
 )
 from py_aep.resolvers.media_probe import probe_media
@@ -613,8 +612,7 @@ class TestImportAiComp:
             source = layer.source.main_source
             assert isinstance(source, FileSource)
             mine = source._opti.tobytes()
-            # ai.ai is CMYK (Coated FOGRA39), so the opti color-space flag = 0x02.
-            assert mine == build_ai_layer_opti_data(612, 792, layer.name, "CMYK")
+            assert mine == build_ai_layer_opti_data(612, 792, layer.name, 2)
             assert mine == _ae_layer_opti(fixture, layer.name)
 
     def test_per_layer_sspc_byte_c9_is_text_zero(self) -> None:
@@ -696,15 +694,9 @@ class TestImportAiComp:
         for layer in comp.layers:
             assert isinstance(layer.source.main_source, FileSource)
 
-    def test_color_space_extraction(self) -> None:
-        # The opti color-space flag (byte 0x33) is derived from the embedded
-        # ICC's data color space: RGB for complex.ai, CMYK for ai.ai.
-        assert read_ai_color_space(ASSETS / "complex.ai") == "RGB"
-        assert read_ai_color_space(ASSETS / "ai.ai") == "CMYK"
-
     def test_complex_comp_per_layer_opti_matches_ae(self) -> None:
-        # Full per-layer opti byte-match for an RGB multi-artboard file
-        # (exercises the color-space flag 0x33 = 0x08 for RGB).
+        # Full per-layer opti byte-match for a multi-artboard file
+        # (exercises byte 0x33, the document's layer count).
         fixture = parse_aep(IMPORT_DIR / "complex_comp.aep").project
         ae = {
             s._opti.text_layer_name: s._opti.tobytes()
@@ -719,6 +711,95 @@ class TestImportAiComp:
         for layer in comp.layers:
             mine = layer.source.main_source._opti.tobytes()
             assert mine == ae[layer.name]
+
+
+class TestImportAiHiddenLayerComp:
+    """A layered .ai whose middle layer the document hides, vs AE ground truth.
+
+    `ai_hidden_layer.ai` is a three-layer Illustrator file with `Hidden`
+    listed in `/OCProperties` `/D` `/OFF`; `ai_hidden_layer_comp.aep` is AE
+    2026's own Import as Composition of it.
+    """
+
+    ASSET = "ai_hidden_layer.ai"
+    FIXTURE = "ai_hidden_layer_comp.aep"
+
+    def test_ae_gives_the_hidden_layer_its_video_switch_off(self) -> None:
+        # The ground truth this class is measured against.
+        fixture = parse_aep(IMPORT_DIR / self.FIXTURE).project
+        comp = next(
+            it
+            for it in fixture.items.values()
+            if isinstance(it, CompItem) and it.name == "ai_hidden_layer"
+        )
+        assert [(layer.name, layer.enabled) for layer in comp.layers] == [
+            ("Top", True),
+            ("Hidden", False),
+            ("Bottom", True),
+        ]
+
+    def test_import_matches_that(self) -> None:
+        project = parse_aep(BASE).project
+        comp = project.import_file(_comp_opts(ASSETS / self.ASSET))
+        assert [(layer.name, layer.enabled) for layer in comp.layers] == [
+            ("Top", True),
+            ("Hidden", False),
+            ("Bottom", True),
+        ]
+
+    def test_per_layer_opti_matches_ae(self) -> None:
+        fixture = parse_aep(IMPORT_DIR / self.FIXTURE).project
+        project = parse_aep(BASE).project
+        comp = project.import_file(_comp_opts(ASSETS / self.ASSET))
+        for layer in comp.layers:
+            source = layer.source.main_source
+            assert isinstance(source, FileSource)
+            mine = source._opti.tobytes()
+            assert mine == _ae_layer_opti(fixture, layer.name)
+            assert mine == build_ai_layer_opti_data(
+                200, 150, layer.name, 3, visible=layer.name != "Hidden"
+            )
+
+    def test_a_hidden_layers_footage_is_still_a_layer_binding(self) -> None:
+        # Byte 0x3D of the opti is 0 for a hidden layer. Reading it as a
+        # "references a layer" flag made the binding invisible: the item
+        # reported no layer name, was named after the file instead of
+        # `Hidden/<file>`, and a CURRENT_VALUE replace rejected it as
+        # whole-document footage.
+        project = parse_aep(BASE).project
+        comp = project.import_file(_comp_opts(ASSETS / self.ASSET))
+        item = next(layer.source for layer in comp.layers if layer.name == "Hidden")
+        source = item.main_source
+        assert isinstance(source, FileSource)
+        assert source._opti.tobytes()[0x3D] == 0
+        assert source.layer_name == "Hidden"
+        assert item.name == "Hidden/ai_hidden_layer.ai"
+
+    def test_replacing_a_hidden_binding_keeps_the_layer(self) -> None:
+        project = parse_aep(BASE).project
+        comp = project.import_file(_comp_opts(ASSETS / self.ASSET))
+        item = next(layer.source for layer in comp.layers if layer.name == "Hidden")
+
+        item.replace(
+            ASSETS / self.ASSET,
+            layer_index=CURRENT_VALUE,
+            layer_dimensions=CURRENT_VALUE,
+        )
+
+        source = item.main_source
+        assert isinstance(source, FileSource)
+        assert source.layer_name == "Hidden"
+        assert source._sspc.layer_index == 1
+        assert source._opti.tobytes()[0x3D] == 0
+
+    def test_roundtrip_byte_identical(self, tmp_path: Path) -> None:
+        project = parse_aep(BASE).project
+        project.import_file(_comp_opts(ASSETS / self.ASSET))
+        out = tmp_path / "hidden.aep"
+        project.save(out)
+        out2 = tmp_path / "hidden2.aep"
+        parse_aep(out).project.save(out2)
+        assert out.read_bytes() == out2.read_bytes()
 
 
 class TestImportEpsComp:
@@ -1524,7 +1605,7 @@ class TestChooseLayerImport:
         box = tuple(v / 65536 for v in struct.unpack(">4i", ae_opti[0x10:0x20]))
         assert box == pytest.approx(expected_box, abs=1e-4)
         assert ae_opti == build_ai_layer_opti_data(
-            612, 792, layer, "CMYK", artwork_bounds=box
+            612, 792, layer, 2, artwork_bounds=box
         )
         # sspc holds the derived integer dims and the Layer Size markers.
         assert struct.unpack(">H", sspc[0x20:0x22])[0] == expected_size[0]

@@ -255,10 +255,7 @@ def _set_transform_defaults(layer: Layer, ae_major: int) -> None:
     # --- Phase 3: context-dependent naming ----------------------------------
     # ExtendScript displays "ADBE Rotate Z" as "Rotation" on 2-D layers
     # and "Z Rotation" on 3-D layers.  Camera and Light layers are always 3-D.
-    is_3d = isinstance(layer, (CameraLayer, LightLayer)) or (
-        isinstance(layer, AVLayer) and layer.three_d_layer
-    )
-    if is_3d:
+    if layer.is_3d:
         # _reorder_and_fill set _auto_name="Rotation" from the spec;
         # undo it so the sentinel _name_utf8 falls through to
         # MATCH_NAME_TO_AUTO_NAME -> "Z Rotation".

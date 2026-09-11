@@ -283,7 +283,9 @@ def build_local_matrix(
 # ------------------------------------------------------------------
 
 
-def build_world_matrix(layer: Layer, time: float | None = None) -> Mat4:
+def build_world_matrix(
+    layer: Layer, time: float | None = None, flatten_2d: bool = False
+) -> Mat4:
     """Build the world transform matrix by composing the parent chain.
 
     Traverses `layer.parent` upward, composing local matrices so that::
@@ -304,7 +306,7 @@ def build_world_matrix(layer: Layer, time: float | None = None) -> Mat4:
     # Compose from root (last in chain) down to the layer itself.
     m = Mat4.identity()
     for lyr in reversed(chain):
-        m @= _layer_local_matrix(lyr, time)
+        m @= _layer_local_matrix(lyr, time, flatten_2d)
     return m
 
 
@@ -317,8 +319,17 @@ def _prop_value(group: PropertyGroup, match_name: str, time: float | None) -> An
     return prop.value_at_time(time)
 
 
-def _layer_local_matrix(layer: Layer, time: float | None = None) -> Mat4:
-    """Build the local matrix for a single layer from its properties."""
+def _layer_local_matrix(
+    layer: Layer, time: float | None = None, flatten_2d: bool = False
+) -> Mat4:
+    """Build the local matrix for a single layer from its properties.
+
+    With `flatten_2d`, the out-of-plane terms are dropped - X/Y rotation,
+    the X/Y orientation angles and the Z translation. That is how After
+    Effects treats an ancestor when compensating a 2D child, which has no
+    way to store them: a 2D layer parented to a null rotated 20/-35/30 gets
+    exactly the compensation of a null rotated 0/0/30.
+    """
     transform = layer.transform
 
     def value(match_name: str) -> Any:
@@ -331,6 +342,13 @@ def _layer_local_matrix(layer: Layer, time: float | None = None) -> Mat4:
     orientation = cast("list[float]", value("ADBE Orientation"))
     rx = cast("float", value("ADBE Rotate X"))
     ry = cast("float", value("ADBE Rotate Y"))
+
+    if flatten_2d:
+        position = position[:2] + [0.0]
+        rx = 0.0
+        ry = 0.0
+        rz = rz + (orientation[2] if len(orientation) > 2 else 0.0)
+        orientation = [0.0, 0.0, 0.0]
 
     is_3d = rx != 0.0 or ry != 0.0 or any(v != 0.0 for v in orientation)
 
@@ -364,6 +382,89 @@ def _mat3_det(m: Mat4) -> float:
         - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
         + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0])
     )
+
+
+def rotation_part(matrix: Mat4) -> Mat4:
+    """The rotation of `matrix`, with translation and scale divided out.
+
+    Column-normalizes the 3x3 block, then negates all three columns when the
+    result is a reflection, so what comes back is always a proper rotation.
+    That mirrors AE, which keeps the rotation proper and pushes the flip into
+    the scale as an all-negative triple: a parent scaled `[-100, 100, 100]`
+    leaves the child at scale `[-100, -100, -100]` with Orientation
+    `[180, 0, 0]`, not at a mirrored rotation.
+
+    Exact for a rotation composed with a uniform scale. A non-uniform parent
+    scale combined with a rotation that is not axis-aligned shears the block,
+    and no rotation represents it - the case where AE's own reparenting jumps
+    too.
+    """
+    rows = [[0.0] * 4 for _ in range(4)]
+    rows[3][3] = 1.0
+    for column in range(3):
+        axis = [matrix[row][column] for row in range(3)]
+        length = _vec3_norm(axis) or 1.0
+        for row in range(3):
+            rows[row][column] = axis[row] / length
+    normalized = Mat4(rows)
+    if _mat3_det(normalized) < 0:
+        for row in range(3):
+            for column in range(3):
+                rows[row][column] = -rows[row][column]
+    return Mat4(rows)
+
+
+def compose_orientation(orientation: list[float], delta: Mat4) -> list[float]:
+    """Euler angles for `delta` applied on top of `orientation`.
+
+    After Effects compensates a reparent of a 3D layer through Orientation
+    rather than through Rotate X/Y/Z: `O_new = parent_rotation^-1 . O_old`,
+    with the rotations left exactly as they were. Verified on AE 2026 across
+    ten cases to 0.01 degrees, including a child carrying its own non-zero
+    rotations - those cancel out of the relation, which is why the answer
+    does not depend on them.
+    """
+    current = (_rotate_x(orientation[0]) @ _rotate_y(orientation[1])) @ _rotate_z(
+        orientation[2]
+    )
+    combined = delta @ current
+    angles = _euler_xyz(
+        combined[0][0],
+        combined[0][1],
+        combined[0][2],
+        combined[1][0],
+        combined[1][1],
+        combined[1][2],
+        combined[2][2],
+    )
+    return [angle % 360.0 for angle in angles]
+
+
+def strip_orientation(matrix: Mat4, orientation: list[float]) -> Mat4:
+    """`matrix` with a layer's Orientation divided out of its 3x3 block.
+
+    `build_local_matrix` composes `T(pos) . O . R . S . T(-anchor)`, so the
+    rotation After Effects would store for a given local matrix is `O^-1`
+    times its 3x3 part - and AE leaves Orientation itself untouched when
+    reparenting (measured on AE 2026: an oriented child under a translating
+    parent gets a new Position and nothing else).
+
+    Only the 3x3 is divided. Orientation sits *inside* the position
+    translation, so left-multiplying the whole 4x4 by `O^-1` would rotate the
+    compensated position as well; the position decomposes from
+    `M[:,3] + M3 . anchor`, which the orientation never enters.
+    """
+    ox, oy, oz = orientation[0], orientation[1], orientation[2]
+    inverse = _rotate_z(-oz) @ _rotate_y(-oy) @ _rotate_x(-ox)
+    rotated = inverse @ matrix
+    rows = [list(matrix[r]) for r in range(4)]
+    for r in range(3):
+        rows[r][0], rows[r][1], rows[r][2] = (
+            rotated[r][0],
+            rotated[r][1],
+            rotated[r][2],
+        )
+    return Mat4(rows)
 
 
 def decompose_transform(

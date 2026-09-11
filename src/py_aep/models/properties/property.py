@@ -68,7 +68,8 @@ from ..validators import (
     validate_string,
 )
 from .gradient import Gradient
-from .keyframe import Keyframe
+from .keyframe import _DEFAULT_INFLUENCE, Keyframe, _timebase_units
+from .keyframe_ease import KeyframeEase
 from .marker import MarkerValue
 from .overrides import (
     _ALWAYS_MODIFIED,
@@ -761,20 +762,27 @@ class Property(PropertyBase):
             kf._next = self.keyframes[idx + 1]
             self.keyframes[idx + 1]._prev = kf
 
-    def _guard_keyframe_move(self, kf: Keyframe, new_frame: int) -> None:
-        """Reject moving `kf` onto another keyframe's frame.
+    def _guard_keyframe_move(self, kf: Keyframe, new_units: int) -> None:
+        """Reject moving `kf` onto another keyframe's exact time.
+
+        Compares raw timebase units rather than frame indices: two
+        keyframes can legitimately share a frame while sitting at
+        different sub-frame times, and rounding would reject that as a
+        collision.
 
         Only applies to a keyframe already in `keyframes`: during
         `add_key` construction the time is assigned before insertion, and
-        landing on an existing frame legitimately returns that keyframe's
+        landing on an existing time legitimately returns that keyframe's
         index instead.
         """
         try:
             index_by_identity(self.keyframes, kf)
         except ValueError:
             return
-        if any(k is not kf and k.frame_time == new_frame for k in self.keyframes):
-            raise ValueError(f"another keyframe already exists at frame {new_frame}")
+        if any(k is not kf and k.time_units == new_units for k in self.keyframes):
+            raise ValueError(
+                f"another keyframe already exists at time {new_units} units"
+            )
 
     def _reposition_keyframe(self, kf: Keyframe) -> None:
         """Restore sorted keyframe order after `kf`'s time changed.
@@ -792,8 +800,8 @@ class Property(PropertyBase):
             old = index_by_identity(self.keyframes, kf)
         except ValueError:
             return
-        new_ft = kf.frame_time
-        new = sum(1 for k in self.keyframes if k is not kf and k.frame_time < new_ft)
+        new_units = kf.time_units
+        new = sum(1 for k in self.keyframes if k is not kf and k.time_units < new_units)
         if new == old:
             return
         _lhd3, ldat = self._ensure_animated()
@@ -826,15 +834,7 @@ class Property(PropertyBase):
         if parent is not None:
             parent._ensure_materialized()
 
-        # Flip synthetic flags on tdmn + entire subtree.
-        if self._tdmn is not None:
-            self._tdmn.synthetic = False
-        self._tdbs.synthetic = False
-        for c in self._tdbs.chunks:
-            c.synthetic = False
-            if hasattr(c, "chunks"):
-                for cc in c.chunks:
-                    cc.synthetic = False
+        self._set_subtree_synthetic(False)
 
         self._ensure_time_base()
         self._complete_static_value_chunks()
@@ -842,6 +842,22 @@ class Property(PropertyBase):
         self._ensure_bound_chunks()
         self._materialize_static_orientation()
         self._ensure_mask_index_chunks()
+
+    def _set_subtree_synthetic(self, value: bool) -> None:
+        """Flip the synthetic flag on `tdmn` and the whole `tdbs` subtree.
+
+        `write_aep` skips synthetic chunks, so this is what hides a
+        property from the writer or reveals it: `False` materializes,
+        `True` un-materializes (see `_revert_to_synthetic`).
+        """
+        if self._tdmn is not None:
+            self._tdmn.synthetic = value
+        self._tdbs.synthetic = value
+        for chunk in self._tdbs.chunks:
+            chunk.synthetic = value
+            if hasattr(chunk, "chunks"):
+                for nested in chunk.chunks:
+                    nested.synthetic = value
 
     def _ensure_mask_index_chunks(self) -> None:
         """Append the `tdli` index chunk AE requires for a materialized
@@ -1291,6 +1307,53 @@ class Property(PropertyBase):
             raw[0] = raw_value
         self._cdat.values = raw
 
+    def _separated_value(self, time: float | None = None) -> list[float] | None:
+        """The leader's value composed from its followers, or `None`.
+
+        While `dimensions_separated` is on, the leader's own `cdat` is dead:
+        AE resets it to the comp-centre default on separate and drives the
+        layer from the X / Y / Z followers instead. Reading the stored value
+        reports that default - `keyframe_separated_dimensions.aep` stores
+        `[100, 100, 0]` on a 200x200 comp where AE reports `[0, 200, 0]`.
+
+        With a `time`, each follower is sampled there instead: the leader
+        holds no keyframes while separated, so `value_at_time` would
+        otherwise report the same frozen value for the whole timeline.
+        """
+        followers = self._separation_followers()
+        if followers is None:
+            return None
+        composed: list[float] = []
+        for follower in followers:
+            component = follower.value if time is None else follower.value_at_time(time)
+            if not isinstance(component, (int, float)):
+                return None
+            composed.append(float(component))
+        return composed
+
+    def _separation_followers(self) -> list[Property] | None:
+        """This leader's X / Y / Z followers while dimensions are separated.
+
+        `None` when the property is not a separated leader, and while the
+        followers have not been synthesized yet - they are created after
+        the leader, so the leader is briefly separated with nothing to
+        drive.
+        """
+        if not self.is_separation_leader or not self.dimensions_separated:
+            return None
+        followers: list[Property] = []
+        for dimension in range(3):
+            try:
+                follower = self.get_separation_follower(dimension)
+            except KeyError:
+                # `get_separation_follower` reaches `PropertyGroup.__getitem__`,
+                # which raises rather than returning None for a missing child.
+                return None
+            if follower is None:
+                return None
+            followers.append(follower)
+        return followers
+
     @property
     def value(self) -> _ValueType:
         """The value of the named property at the current time.
@@ -1318,6 +1381,9 @@ class Property(PropertyBase):
             if layer_id == 0:
                 return 0
             return self._composition._layer_id_to_index.get(layer_id, -1) + 1
+        separated = self._separated_value()
+        if separated is not None:
+            return separated
         if self._value is not None:
             if (
                 self.match_name == "ADBE Mask Shape"
@@ -1340,6 +1406,50 @@ class Property(PropertyBase):
 
     @value.setter
     def value(self, value: _ValueType) -> None:
+        if self._separation_followers() is not None:
+            raise ValueError(
+                f"cannot set the value of {self.match_name!r} while its "
+                f"dimensions are separated; write its X / Y / Z followers "
+                f"instead (get_separation_follower)"
+            )
+        self._set_own_value(value)
+
+    def _set_separated_value(
+        self, value: _ValueType, followers: list[Property]
+    ) -> None:
+        """Write a separated leader's value through its X / Y / Z followers.
+
+        Not reachable from the public setter, which rejects a separated
+        leader as After Effects does. This is the path AE takes *itself*
+        when it reparents a layer: it compensates the followers even though
+        `setValue` on the leader errors. `Layer.parent` is the caller.
+
+        While `dimensions_separated` is on the leader's own `cdat` is dead -
+        AE drives the layer from the followers - so a write that landed
+        there would read back as the stale default and never reach what AE
+        renders. This is the write-side counterpart of `_separated_value`.
+
+        Only components that actually change are written, which leaves an
+        untouched Z follower synthetic on a 2D layer (as AE does) and
+        avoids materializing it for nothing.
+        """
+        _validate_value(self, value)
+        if not isinstance(value, (list, tuple)):
+            raise ValueError(
+                "a dimension-separated property's value must be a sequence "
+                f"of {len(followers)} numbers"
+            )
+        for follower, component in zip(followers, value):
+            if follower.value != component:
+                follower.value = component
+
+    def _set_own_value(self, value: _ValueType) -> None:
+        """Write this property's own value, bypassing any separation fan-out.
+
+        The raw path under the `value` setter, for the deliberate "park the
+        leader on its default" writes in `_separate_static` /
+        `_separate_animated`, which target the dead leader on purpose.
+        """
         # Re-assigning the identical complex value object (TextDocument,
         # Shape, MarkerValue, Gradient) is a no-op: those types write through
         # to the backing chunks via their own descriptors. Plain numeric/list
@@ -1744,11 +1854,270 @@ class Property(PropertyBase):
     @dimensions_separated.setter
     def dimensions_separated(self, value: bool) -> None:
         validate_bool(value)
-        if self.match_name == _SEPARATION_LEADER:
-            self._ensure_materialized()
-            assert self._tdsb is not None
-            self._tdsb.dimensions_separated = value
-            self._dimensions_separated = value
+        if not self.is_separation_leader:
+            # AE silently ignores this on a non-leader; raising keeps a
+            # caller's mistake visible instead of swallowing the write.
+            raise ValueError(
+                f"dimensions_separated is only settable on the separation "
+                f"leader, not {self.match_name!r}"
+            )
+        if value == self.dimensions_separated:
+            # AE's dimensionsSeparated is idempotent. Re-running the transfer
+            # would re-seed the followers from a leader that the first call
+            # already reset to its default, destroying the separated values.
+            return
+
+        try:
+            followers = [self.get_separation_follower(dim) for dim in range(3)]
+        except KeyError:
+            # `get_separation_follower` reaches `PropertyGroup.__getitem__`,
+            # which raises rather than returning None for a missing child.
+            followers = []
+        if not followers or any(follower is None for follower in followers):
+            raise ValueError(
+                f"{self.match_name!r} has no separation followers to transfer to"
+            )
+        live = cast("list[Property]", followers)
+        animated = bool(self.keyframes) or any(follower.keyframes for follower in live)
+        if value:
+            if animated:
+                self._separate_animated(live)
+            else:
+                self._separate_static(live)
+        elif animated:
+            self._recombine_animated(live)
+        else:
+            self._recombine_static(live)
+
+    def _separate_static(self, followers: list[Property]) -> None:
+        """Hand the leader's components to its followers.
+
+        AE seeds X / Y / Z from the leader, materializes them, and resets the
+        leader's own `cdat` to the property default - while separated the
+        leader is dead and the followers drive the layer. Z is materialized
+        only on a 3D layer, matching AE (`transform_separated.aep` leaves it
+        synthetic on a 2D one).
+        """
+        components = cast("list[float]", self.value)
+        default = cast("list[float]", self.default_value)
+        self._ensure_materialized()
+        assert self._tdsb is not None
+        self._tdsb.dimensions_separated = True
+        self._dimensions_separated = True
+        three_d = self._containing_layer.is_3d
+        for dimension, follower in enumerate(followers):
+            if dimension == 2 and not three_d:
+                continue
+            follower.value = components[dimension]
+        # The leader keeps a value AE never reads again; AE parks it on the
+        # default rather than leaving the old position there.
+        self._set_own_value(list(default))
+
+    def _recombine_static(self, followers: list[Property]) -> None:
+        """Fold the followers back into the leader.
+
+        AE writes the composed value onto the leader and reverts the
+        followers to their dead, unserialized state.
+        """
+        composed = [float(cast("float", follower.value)) for follower in followers]
+        self._ensure_materialized()
+        assert self._tdsb is not None
+        self._tdsb.dimensions_separated = False
+        self._dimensions_separated = False
+        self.value = composed
+        for follower in followers:
+            follower._revert_to_synthetic()
+
+    @staticmethod
+    def _segment_spans(times: list[float]) -> tuple[list[float], list[float]]:
+        """Incoming and outgoing segment durations for each keyframe."""
+        incoming = [0.0] + [times[i] - times[i - 1] for i in range(1, len(times))]
+        outgoing = [times[i + 1] - times[i] for i in range(len(times) - 1)] + [0.0]
+        return incoming, outgoing
+
+    def _separate_animated(self, followers: list[Property]) -> None:
+        """Move the leader's keyframes onto its followers.
+
+        AE turns each spatial tangent into a per-dimension temporal ease:
+        `speed = |tangent| * 100` and `influence = 1 / dt` percent, where
+        `dt` is that side's segment duration. Measured on AE 2026 over
+        segment durations of 0.5, 2.5, 5 and 12 s - 16 components, all
+        matching. The in-side tangent points backwards, so its speed takes
+        the opposite sign.
+
+        Interpolation types are copied across rather than derived from
+        whether a tangent is non-zero, which is what AE does: AE flattens a
+        HOLD keyframe to LINEAR here, and this project prefers not to mirror
+        that loss.
+        """
+        keyframes = list(self.keyframes)
+        times = [keyframe.time for keyframe in keyframes]
+        values = [cast("list[float]", keyframe.value) for keyframe in keyframes]
+        in_tangents = [keyframe.in_spatial_tangent or [] for keyframe in keyframes]
+        out_tangents = [keyframe.out_spatial_tangent or [] for keyframe in keyframes]
+        interpolation = [
+            (keyframe.in_interpolation_type, keyframe.out_interpolation_type)
+            for keyframe in keyframes
+        ]
+        incoming, outgoing = self._segment_spans(times)
+
+        while self.keyframes:
+            self.remove_key(0)
+        self._ensure_materialized()
+        assert self._tdsb is not None
+        self._tdsb.dimensions_separated = True
+        self._dimensions_separated = True
+        self._set_own_value(list(cast("list[float]", self.default_value)))
+
+        three_d = self._containing_layer.is_3d
+        for dimension, follower in enumerate(followers):
+            if dimension == 2 and not three_d:
+                continue
+            for index, time in enumerate(times):
+                added = follower._add_key(time, values[index][dimension])
+                keyframe = follower.keyframes[added]
+                keyframe.in_interpolation_type = interpolation[index][0]
+                keyframe.out_interpolation_type = interpolation[index][1]
+                # Before the ease, not after: the continuity flag ties the
+                # out speed to the in speed, and AE's own separated keyframes
+                # carry tC=True with *different* speeds on each side.
+                keyframe.temporal_continuous = True
+                for direction, tangents, spans in (
+                    ("in", in_tangents, incoming),
+                    ("out", out_tangents, outgoing),
+                ):
+                    span = spans[index]
+                    tangent = tangents[index]
+                    if span <= 0 or dimension >= len(tangent):
+                        # An outer side has no segment to ease along; AE
+                        # parks it on zero speed and the default influence.
+                        keyframe._apply_ease(
+                            [KeyframeEase(speed=0.0, influence=_DEFAULT_INFLUENCE)],
+                            direction,
+                        )
+                        continue
+                    speed = tangent[dimension] * 100.0
+                    if direction == "in":
+                        speed = -speed
+                    # Clamped: influence is a percentage, and a segment
+                    # shorter than 0.01 s (sub-frame keys, or one frame of a
+                    # very high frame rate) drives `1/dt` past the 100% the
+                    # field can mean.
+                    keyframe._apply_ease(
+                        [KeyframeEase(speed=speed, influence=min(1.0 / span, 100.0))],
+                        direction,
+                    )
+
+    def _recombine_animated(self, followers: list[Property]) -> None:
+        """Fold the followers' keyframes back into the leader.
+
+        The inverse of `_separate_animated`: a tangent component is
+        `speed * (influence / 100) * dt`, which round-tripped exactly in the
+        AE probe.
+
+        The leader gets a keyframe at the union of the followers' times, not
+        at one follower's: separation exists so each axis can be keyed on its
+        own, and pairing the lists positionally wrote X's second value beside
+        Y's second value however far apart in time they sat. A dimension with
+        no keyframe of its own at a given time contributes its interpolated
+        value there, and no tangent.
+        """
+        if not any(follower.keyframes for follower in followers):
+            self._recombine_static(followers)
+            return
+        keys_at: list[dict[float, Keyframe]] = [
+            {keyframe.time: keyframe for keyframe in follower.keyframes}
+            for follower in followers
+        ]
+        times = sorted({time for per_dimension in keys_at for time in per_dimension})
+        incoming, outgoing = self._segment_spans(times)
+        dimensions = len(followers)
+        composed = [[0.0] * dimensions for _ in times]
+        in_tangents = [[0.0] * dimensions for _ in times]
+        out_tangents = [[0.0] * dimensions for _ in times]
+        # Interpolation is per keyframe, not per dimension: take it from the
+        # first dimension that has a keyframe at that time.
+        interpolation = [
+            next(
+                (
+                    (
+                        per_dimension[time].in_interpolation_type,
+                        per_dimension[time].out_interpolation_type,
+                    )
+                    for per_dimension in keys_at
+                    if time in per_dimension
+                ),
+                (KeyframeInterpolationType.LINEAR, KeyframeInterpolationType.LINEAR),
+            )
+            for time in times
+        ]
+
+        for dimension, follower in enumerate(followers):
+            for index, time in enumerate(times):
+                keyframe = keys_at[dimension].get(time)
+                if keyframe is None:
+                    sampled = follower.value_at_time(time)
+                    composed[index][dimension] = (
+                        float(sampled) if isinstance(sampled, (int, float)) else 0.0
+                    )
+                    continue
+                composed[index][dimension] = float(cast("float", keyframe.value))
+                for direction, target, spans in (
+                    ("in", in_tangents, incoming),
+                    ("out", out_tangents, outgoing),
+                ):
+                    span = spans[index]
+                    if span <= 0:
+                        continue
+                    ease = (
+                        keyframe.in_temporal_ease
+                        if direction == "in"
+                        else keyframe.out_temporal_ease
+                    )
+                    if not ease:
+                        continue
+                    magnitude = ease[0].speed * (ease[0].influence / 100.0) * span
+                    target[index][dimension] = (
+                        -magnitude if direction == "in" else magnitude
+                    )
+
+        for follower in followers:
+            while follower.keyframes:
+                follower.remove_key(0)
+            follower._revert_to_synthetic()
+
+        self._ensure_materialized()
+        assert self._tdsb is not None
+        self._tdsb.dimensions_separated = False
+        self._dimensions_separated = False
+        for index, time in enumerate(times):
+            self._add_key(time, composed[index])
+        for index, keyframe in enumerate(self.keyframes):
+            if index >= len(times):
+                break
+            keyframe.in_interpolation_type = interpolation[index][0]
+            keyframe.out_interpolation_type = interpolation[index][1]
+            if keyframe.in_spatial_tangent is not None:
+                keyframe.in_spatial_tangent = in_tangents[index][
+                    : len(keyframe.in_spatial_tangent)
+                ]
+            if keyframe.out_spatial_tangent is not None:
+                keyframe.out_spatial_tangent = out_tangents[index][
+                    : len(keyframe.out_spatial_tangent)
+                ]
+
+    def _revert_to_synthetic(self) -> None:
+        """Hide this property's chunks from `write_aep` again.
+
+        The inverse of `_ensure_materialized`'s flag flip, for a property AE
+        un-materializes - a separation follower once its leader is
+        recombined. Chunk order is left alone: synthetic chunks are skipped
+        on write, and `_reposition_canonically` runs again if the property is
+        ever materialized anew.
+        """
+        if self._tdsb is None or self._tdsb.synthetic:
+            return
+        self._set_subtree_synthetic(True)
 
     @property
     def expression(self) -> str:
@@ -1822,6 +2191,15 @@ class Property(PropertyBase):
             # property, which for MARKER / NO_VALUE kinds emits chunks AE
             # rejects.
             raise ValueError(f"property {self.match_name!r} cannot take an expression")
+        if value and not self.expression:
+            # AE silently no-ops here, leaving expressionEnabled false. Doing
+            # the same would clear the tdb4 disabled bit for an expression
+            # that does not exist - a byte AE never writes, which the getter
+            # then masks behind `bool(self.expression)`. Raising instead of
+            # mirroring the no-op keeps the caller's mistake visible.
+            raise ValueError(
+                f"property {self.match_name!r} has no expression to enable"
+            )
         self._ensure_materialized()
         self._expression_enabled = value
         self._tdb4.expression_disabled = not value
@@ -2242,6 +2620,9 @@ class Property(PropertyBase):
                 "Expression evaluation is not supported by the parser."
             )
         if not self.keyframes:
+            separated = self._separated_value(time)
+            if separated is not None:
+                return separated
             return self.value
 
         return interpolate_keyframes(time, self.keyframes, self.is_spatial)
@@ -2395,6 +2776,11 @@ class Property(PropertyBase):
         tdb4_apply_animated_template(
             t, color=bool(self._color), spatial=self.is_spatial
         )
+        # The template cannot know the comp's timebase or pixel aspect.
+        # `_ensure_materialized` stamps them, but only for a synthesized
+        # property - one parsed from a real file returns early there, so
+        # animating it needs the stamp applied here too.
+        self._ensure_time_base()
         if preserved is not None:
             t._value_hint_flag, t._cvot_flags, t._time_base = preserved
 
@@ -2423,21 +2809,27 @@ class Property(PropertyBase):
         ldat = cast("LdatChunk", find_by_type(chunks=inner.chunks, chunk_type="ldat"))
         return lhd3, ldat
 
-    def _keyframe_insert_index(self, frame_time: int) -> tuple[int, bool]:
-        """Locate `frame_time` among the keyframes.
+    def _keyframe_insert_index(self, time_units: int) -> tuple[int, bool]:
+        """Locate `time_units` among the keyframes.
 
         Returns `(index, exists)`: when a keyframe already sits at
-        `frame_time`, `exists` is True and `index` is its position;
+        `time_units`, `exists` is True and `index` is its position;
         otherwise `exists` is False and `index` is the sorted insertion
-        point.
+        point. Keyed on raw units rather than frame indices so two
+        sub-frame keyframes inside one frame stay distinct.
         """
         for i, kf in enumerate(self.keyframes):
-            if kf.frame_time == frame_time:
+            if kf.time_units == time_units:
                 return i, True
         idx = 0
-        while idx < len(self.keyframes) and self.keyframes[idx].frame_time < frame_time:
+        while idx < len(self.keyframes) and self.keyframes[idx].time_units < time_units:
             idx += 1
         return idx, False
+
+    def _keyframe_units_at(self, time: float) -> int:
+        """Layer-relative keyframe units for a composition `time` in seconds."""
+        timebase = _timebase_units(*self._time_units())
+        return round((time - self._start_time_offset) * timebase)
 
     def can_add_to_motion_graphics_template(self, comp: CompItem) -> bool:
         """Test whether this property can be added to `comp`'s Essential
@@ -2537,9 +2929,8 @@ class Property(PropertyBase):
         )
         kf._bind_property(self)
         kf.time = time
-        new_ft = kf.frame_time
 
-        idx, exists = self._keyframe_insert_index(new_ft)
+        idx, exists = self._keyframe_insert_index(kf.time_units)
         if exists:
             return idx
         ldat.items.insert(idx, ldat_item)
@@ -2547,6 +2938,13 @@ class Property(PropertyBase):
         set_lhd3_count(lhd3, len(self.keyframes), LHD3_BLOCK_KEYFRAMES)
         kf.value = new_value
         self._link_inserted_key(idx)
+        # The static value is now dead: `value` reads the keyframes, but its
+        # cache short-circuits ahead of that check, so animating a property
+        # that had been read (or written) statically kept reporting the old
+        # number. Complex kinds keep their cached object - callers rely on
+        # mutating it in place - and they animate through other paths.
+        if isinstance(self._value, (int, float, list)):
+            self._value = None
         return idx
 
     def remove_key(self, key_index: int) -> None:
@@ -2811,8 +3209,7 @@ class Property(PropertyBase):
         )
         kf._bind_property(self)
         kf.time = time
-        new_ft = kf.frame_time
-        idx, exists = self._keyframe_insert_index(new_ft)
+        idx, exists = self._keyframe_insert_index(kf.time_units)
         if exists:
             return idx
         self._ensure_materialized()
@@ -2937,8 +3334,7 @@ class Property(PropertyBase):
         )
         kf._bind_property(self)
         kf.time = time
-        new_ft = kf.frame_time
-        idx, exists = self._keyframe_insert_index(new_ft)
+        idx, exists = self._keyframe_insert_index(kf.time_units)
         if exists:
             return idx
         was_static = not self.keyframes
@@ -3039,13 +3435,19 @@ class Property(PropertyBase):
             new_value: The value to set at that time.
         """
         validate_number(time)
+        if self._separation_followers() is not None:
+            # AE 2026 rejects this on a separated leader for the same reason
+            # `setValue` is rejected: the followers hold the animation.
+            raise ValueError(
+                f"cannot set a value on {self.match_name!r} while its "
+                f"dimensions are separated; key its X / Y / Z followers "
+                f"instead (get_separation_follower)"
+            )
         kind = self._parallel_kind()
         if kind is not None:
             self._set_parallel_value_at(time, new_value, kind)
             return
-        _, frame_rate = self._time_units()
-        target_ft = round(time * frame_rate)
-        idx, exists = self._keyframe_insert_index(target_ft)
+        idx, exists = self._keyframe_insert_index(self._keyframe_units_at(time))
         if exists:
             self.keyframes[idx].value = new_value
             return
@@ -3060,12 +3462,11 @@ class Property(PropertyBase):
         container, so an existing key's value chunk is rebuilt rather than
         written through a descriptor.
         """
-        _, frame_rate = self._time_units()
-        target_ft = round(time * frame_rate)
+        target_units = self._keyframe_units_at(time)
         if kind is TEXT_KIND:
             new_text = value.text if isinstance(value, TextDocument) else value
             for kf in self.keyframes:
-                if kf.frame_time == target_ft:
+                if kf.time_units == target_units:
                     td = kf.value
                     if isinstance(td, TextDocument) and isinstance(new_text, str):
                         # The text setter already re-serializes the COS blob.
@@ -3076,7 +3477,7 @@ class Property(PropertyBase):
             return
         value = cast("_ValueType", kind.coerce(value))
         for kf in self.keyframes:
-            if kf.frame_time == target_ft:
+            if kf.time_units == target_units:
                 self._write_parallel_kf_value(kf, value, kind)
                 return
         self._add_parallel_key(time, kind, value=value)
@@ -3139,28 +3540,25 @@ class Property(PropertyBase):
             self.set_value_at_time(time, value)
 
     @property
-    def _frame_offset(self) -> int:
-        """Frame offset for converting layer-relative keyframe times to comp time.
+    def _start_time_offset(self) -> float:
+        """Seconds between layer-relative keyframe times and composition time.
 
-        The binary stores keyframe times relative to the layer's start.
-        ExtendScript reports them in composition time.  This property
-        lazily computes the offset from the containing layer's start_time
-        and composition frame rate.
+        The binary stores keyframe times relative to the layer's start;
+        ExtendScript reports them in composition time. Kept in seconds
+        rather than whole frames so a sub-frame keyframe survives the
+        conversion - AE leaves a layer start off the frame grid after a
+        frame-rate change, which a rounded offset would then quantize.
         """
-        layer = self._containing_layer
-        start_time: float = layer.start_time
-        if start_time == 0.0:
-            return 0
-        result: int = round(start_time * layer.containing_comp.frame_rate)
-        return result
+        return self._containing_layer.start_time
 
     @property
     def _effect_scale(self) -> list[float] | None:
         """Scale factors for denormalizing 0-1 binary values to pixel coordinates.
 
         Lazily computed from context:
-        - Effect point properties (TWO_D inside an effect): composition
-          dimensions.
+        - Effect point properties (TWO_D inside an effect): layer
+          dimensions (`Layer.width` / `height`, which already fall back to
+          the comp for a source-less layer).
         - Anchor Point: layer source dimensions, but ONLY when the layer
           has a source. Source-less layers (shape, text, null) store the
           anchor in raw pixels - AE does not normalize it - so applying a
@@ -3175,21 +3573,25 @@ class Property(PropertyBase):
         scale: list[float] | None = None
 
         if self.match_name == "ADBE Anchor Point":
-            layer = self._containing_layer
             # Only footage/comp layers normalize the anchor to source size;
             # source-less layers (shape, text, null) store it in raw pixels.
-            if getattr(layer, "source", None) is not None:
-                width = getattr(layer, "width", 0)
-                height = getattr(layer, "height", 0)
-                if width and height:
-                    scale = [float(width), float(height), 1.0]
+            if getattr(self._containing_layer, "source", None) is not None:
+                size = self._layer_pixel_size()
+                if size is not None:
+                    scale = [size[0], size[1], 1.0]
         elif (
             self._property_control_type == PropertyControlType.TWO_D
             and self._is_in_effect()
         ):
-            layer = self._containing_layer
-            comp = layer.containing_comp
-            scale = [float(comp.width), float(comp.height)]
+            # An effect point is stored normalized against the LAYER, not
+            # the composition. Measured on AE 2026: a Ramp start point set to
+            # 100 on a 200x200 solid in an 800x600 comp stores 0.5, which
+            # only 100/200 produces - comp normalization would store 0.125.
+            # `Layer.width` already falls back to the comp for source-less
+            # layers, which is what AE uses there.
+            size = self._layer_pixel_size()
+            if size is not None:
+                scale = list(size)
 
         return scale
 
@@ -3200,6 +3602,19 @@ class Property(PropertyBase):
         ):
             raise ValueError("_effect_scale must be a list of at least 2 floats")
         self.__dict__["_effect_scale"] = value
+
+    def _layer_pixel_size(self) -> tuple[float, float] | None:
+        """The containing layer's pixel dimensions, or `None`.
+
+        `width` / `height` live on [AVLayer][]; a camera or light layer has
+        neither, and nothing normalized against a layer sits on one.
+        """
+        layer = self._containing_layer
+        width = getattr(layer, "width", 0)
+        height = getattr(layer, "height", 0)
+        if width and height:
+            return float(width), float(height)
+        return None
 
 
 class _EssentialOverrideProperty(Property):

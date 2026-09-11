@@ -199,6 +199,12 @@ class AVLayer(Layer):
     automatically sets [environment_layer][] to `False`.
     Read / Write."""
 
+    @property
+    def is_3d(self) -> bool:
+        """Whether the layer transforms in three dimensions - its 3D switch.
+        Read-only."""
+        return self.three_d_layer
+
     three_d_per_char = ChunkField.bool(
         "_ldta",
         "three_d_per_char",
@@ -788,11 +794,21 @@ class AVLayer(Layer):
         currently_enabled = bool(prop._animated)
         if value and not currently_enabled:
             # Enabling time remapping converts the static Time Remap property
-            # into an animated one with a placeholder keyframe (cdat -> LIST:list
-            # swap + animated tdb4 state). Flipping only the tdb4.animated bit
-            # leaves a contradictory static-and-animated property with no
-            # keyframe list, which AE reports as "file is damaged".
-            prop._add_key(self.in_point)
+            # into an animated one (cdat -> LIST:list swap + animated tdb4
+            # state). Flipping only the tdb4.animated bit leaves a
+            # contradictory static-and-animated property with no keyframe
+            # list, which AE reports as "file is damaged".
+            #
+            # AE seeds an identity ramp of exactly two LINEAR keyframes,
+            # spanning the source from the layer's start rather than from its
+            # in point: (start_time, 0) and (start_time + duration, duration).
+            # Measured on AE 2026 for comp and footage sources, including a
+            # layer offset in time; a single keyframe leaves the remap frozen.
+            source = self.source
+            assert source is not None  # can_set_time_remap_enabled guarantees it
+            duration = source.duration
+            prop._add_key(self.start_time, 0.0)
+            prop._add_key(self.start_time + duration, duration)
         elif not value and currently_enabled:
             while prop.keyframes:
                 prop.remove_key(0)

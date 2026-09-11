@@ -13,11 +13,13 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from ..data.file_formats import AI_COMP_EXTENSIONS, PSD_COMP_EXTENSIONS
-from .ai_layers import read_ai_layers
+from .ai_layers import read_ai_layer_ocgs, read_ai_layers
 from .psd_layers import PsdGroup, PsdLayer, read_psd_layers
 
 if TYPE_CHECKING:
     import os
+
+    from .ai_layers import AiLayer
 
 
 def psd_leaf_layers(file: str | os.PathLike[str]) -> list[PsdLayer]:
@@ -137,7 +139,7 @@ def resolve_ai_layer(
     file: str | os.PathLike[str],
     layer_index: int,
     data: bytes | None = None,
-) -> tuple[int, str]:
+) -> tuple[list[AiLayer], int]:
     """Resolve an AI/PDF layer chosen by `list_layers` position.
 
     Args:
@@ -146,16 +148,18 @@ def resolve_ai_layer(
         data: The file's bytes, if the caller already read them.
 
     Returns:
-        A `(document_index, name)` tuple, where `document_index` is the
-        layer's document-order (bottom-first) position as stored in the
-        binary.
+        A `(layers, document_index)` tuple: the file's layers in document
+        order (bottom layer first) and the chosen layer's position in them,
+        which is the index the binary stores. The whole list comes back
+        because the binding also records how many layers the document has.
 
     Raises:
         ValueError: If `layer_index` is out of range.
         UnsupportedAiLayersError: If the file's layers cannot be read.
     """
-    names = read_ai_layers(file, data)
-    if not 0 <= layer_index < len(names):
-        raise _out_of_range(file, layer_index, list(reversed(names)))
-    doc_index = len(names) - 1 - layer_index
-    return doc_index, names[doc_index]
+    layers = read_ai_layer_ocgs(file, data)
+    if not 0 <= layer_index < len(layers):
+        raise _out_of_range(
+            file, layer_index, [layer.name for layer in reversed(layers)]
+        )
+    return layers, len(layers) - 1 - layer_index

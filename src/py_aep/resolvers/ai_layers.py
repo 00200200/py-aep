@@ -14,7 +14,7 @@ import io
 import re
 import zlib
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
 from ..color.icc import icc_profile_description
 from ..cos import CosParser, IndirectObject, IndirectReference
@@ -26,6 +26,21 @@ if TYPE_CHECKING:
 
 class UnsupportedAiLayersError(ValueError):
     """Raised when a `.ai`/`.pdf` file's layers cannot be enumerated."""
+
+
+class AiLayer(NamedTuple):
+    """One Illustrator/PDF layer (Optional Content Group)."""
+
+    object_number: int
+    """The OCG's PDF indirect-object number."""
+
+    name: str
+    """The layer name."""
+
+    visible: bool
+    """`False` when the default configuration hides the layer (the OCG is
+    listed in `/D` `/OFF`). After Effects records this in the per-layer
+    `opti` and gives the imported comp layer its video switch off."""
 
 
 _OBJ_RE = re.compile(rb"(\d+)[ \t\r\n]+(\d+)[ \t\r\n]+obj\b")
@@ -55,17 +70,33 @@ def _resolve(value: Any, data: bytes, offsets: dict[int, int]) -> Any:
     return value
 
 
-def read_ai_layers(
+def _order_object_numbers(value: Any, out: set[int]) -> set[int]:
+    """Collect every OCG object number referenced by a `/D` `/Order` tree."""
+    if isinstance(value, list):
+        for entry in value:
+            _order_object_numbers(entry, out)
+    elif isinstance(value, IndirectReference):
+        out.add(value.object_number)
+    return out
+
+
+def read_ai_layer_ocgs(
     file: str | os.PathLike[str], data: bytes | None = None
-) -> list[str]:
-    """Return the Illustrator/PDF layer names in document order.
+) -> list[AiLayer]:
+    """Return one `AiLayer` per layer, in document order (bottom layer first).
+
+    Illustrator can leave the optional content groups of earlier revisions of
+    the artwork behind in `/OCGs`: one 2019-vintage file lists 65 groups for
+    the 25 layers it has, the stale 40 first. The leftovers are exactly the
+    groups the default configuration's `/Order` omits, and that is the set
+    After Effects imports - checked against an AE-authored project whose
+    footage layer indices only line up with the `/Order` members. `/Order`
+    decides membership only; `/OCGs` still gives the order (see the module
+    docstring).
 
     Args:
         file: Path to a `.ai` or `.pdf` file.
         data: The file's bytes, if the caller already read them.
-
-    Returns:
-        Layer names in document (OCG) order, bottom layer first.
 
     Raises:
         UnsupportedAiLayersError: If the file is not a PDF-compatible document
@@ -90,16 +121,50 @@ def read_ai_layers(
     oc_properties = _resolve(parser.parse_value(), data, offsets)
     if not isinstance(oc_properties, dict):
         raise UnsupportedAiLayersError(f"{name}: unreadable /OCProperties.")
+    config = _resolve(oc_properties.get("D"), data, offsets)
+    if not isinstance(config, dict):
+        config = {}
+    members = _order_object_numbers(_resolve(config.get("Order"), data, offsets), set())
+    hidden = _order_object_numbers(_resolve(config.get("OFF"), data, offsets), set())
     ocgs = _resolve(oc_properties.get("OCGs"), data, offsets)
-    names: list[str] = []
+    layers: list[AiLayer] = []
     if isinstance(ocgs, list):
         for ref in ocgs:
+            if not isinstance(ref, IndirectReference):
+                continue
+            if members and ref.object_number not in members:
+                continue
             ocg = _resolve(ref, data, offsets)
             if isinstance(ocg, dict) and "Name" in ocg:
-                names.append(str(ocg["Name"]))
-    if not names:
+                layers.append(
+                    AiLayer(
+                        ref.object_number,
+                        str(ocg["Name"]),
+                        ref.object_number not in hidden,
+                    )
+                )
+    if not layers:
         raise UnsupportedAiLayersError(f"{name}: no named layers found.")
-    return names
+    return layers
+
+
+def read_ai_layers(
+    file: str | os.PathLike[str], data: bytes | None = None
+) -> list[str]:
+    """Return the Illustrator/PDF layer names in document order.
+
+    Args:
+        file: Path to a `.ai` or `.pdf` file.
+        data: The file's bytes, if the caller already read them.
+
+    Returns:
+        Layer names in document (OCG) order, bottom layer first.
+
+    Raises:
+        UnsupportedAiLayersError: If the file is not a PDF-compatible
+            document or has no Optional Content Groups (layers).
+    """
+    return [layer.name for layer in read_ai_layer_ocgs(file, data)]
 
 
 _STREAM_RE = re.compile(rb"stream\r?\n(.*?)\r?\nendstream", re.DOTALL)
@@ -131,31 +196,9 @@ def _find_ai_icc(
     return None
 
 
-def read_ai_color_info(
+def read_ai_color_profile(
     file: str | os.PathLike[str], data: bytes | None = None
-) -> tuple[str | None, str | None]:
-    """Return `(data color space, profile name)` from the embedded ICC profile.
-
-    Reads and inflates the file once. Prefer this over calling
-    `read_ai_color_space` and `read_ai_color_profile` separately, which each
-    re-scan the file. Both values are `None` when the file is not
-    PDF-compatible or has no embedded profile.
-
-    The data color space is the ICC header signature (bytes 16-19): `RGB `,
-    `CMYK`, `GRAY`, or `Lab `. The profile name comes from the `desc` tag.
-
-    Args:
-        file: Path to a `.ai` or `.pdf` file.
-        data: The file's bytes, if the caller already read them.
-    """
-    icc = _find_ai_icc(file, data)
-    if icc is None:
-        return None, None
-    color_space = icc[16:20].decode("latin-1").strip() or None
-    return color_space, icc_profile_description(icc)
-
-
-def read_ai_color_profile(file: str | os.PathLike[str]) -> str | None:
+) -> str | None:
     """Return the embedded ICC color profile name, or `None`.
 
     After Effects records a PDF-compatible Illustrator/PDF file's embedded
@@ -163,20 +206,16 @@ def read_ai_color_profile(file: str | os.PathLike[str]) -> str | None:
     footage item, read here from the ICC `desc` tag. Returns `None` when the
     file is not PDF-compatible or has no embedded profile.
 
-    Args:
-        file: Path to a `.ai` or `.pdf` file.
-    """
-    return read_ai_color_info(file)[1]
-
-
-def read_ai_color_space(file: str | os.PathLike[str]) -> str | None:
-    """Return the embedded ICC profile's data color space, or `None`.
-
-    The ICC header's data-color-space signature (bytes 16-19) is `RGB `,
-    `CMYK`, `GRAY`, or `Lab `. AE encodes it in the footage `opti`. Returns
-    `None` when the file has no embedded profile.
+    The profile's data color space (the header signature at bytes 16-19) is
+    NOT read: AE does not record it anywhere in the footage item. The `opti`
+    byte that looked like a color-space flag is the document's layer count
+    (`binary.footage_chunks.TextOptiChunk.text_document_layers`).
 
     Args:
         file: Path to a `.ai` or `.pdf` file.
+        data: The file's bytes, if the caller already read them.
     """
-    return read_ai_color_info(file)[0]
+    icc = _find_ai_icc(file, data)
+    if icc is None:
+        return None
+    return icc_profile_description(icc)

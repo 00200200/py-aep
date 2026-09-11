@@ -528,8 +528,9 @@ def build_ai_layer_opti_data(
     width: int,
     height: int,
     layer_name: str,
-    color_space: str | None = None,
+    layer_count: int,
     artwork_bounds: tuple[float, float, float, float] | None = None,
+    visible: bool = True,
 ) -> bytes:
     """Build the 596-byte `TEXT` `opti` for one layer of a layered AI/PDF import.
 
@@ -538,10 +539,11 @@ def build_ai_layer_opti_data(
     its source layer selected. The selection is stored entirely in this opti.
     It extends `build_text_opti_data` with:
 
-    - `text_color_space` (0x33): the document color-space flag.
+    - `text_document_layers` (0x33): the source document's layer count.
     - `text_element_count` (0x3C): element/page count (1).
-    - `text_layer_reference` (0x3D): per-layer-reference flag (`True`;
-      whole-document footage is `False`).
+    - `text_layer_visible` (0x3D): the source layer's visibility in the
+      Illustrator/PDF document (`False` for a layer the file's default
+      configuration hides).
     - `text_layer_name` (0x44): the layer name, NUL-terminated.
     - `text_page_height`/`text_page_width` (0x248/0x24C): the redundant
       page-dimension tail (BE u16).
@@ -563,19 +565,19 @@ def build_ai_layer_opti_data(
         width: Document width in points.
         height: Document height in points.
         layer_name: The referenced layer's name.
-        color_space: The document color space (`"CMYK"` flags byte 0x33).
+        layer_count: How many layers the source document has.
         artwork_bounds: The layer's artwork box `(x0, y0, x1, y1)` in page
             points for a Layer Size import; `None` keeps the full-page box
             (Document Size and comp imports).
+        visible: The layer's visibility in the source document
+            (`resolvers.ai_layers.AiLayer.visible`).
     """
     chunk = TextOptiChunk(
         text_width=width,
         text_height=height,
-        # Document color-space flag: 0x02 for CMYK, 0x08 otherwise (RGB +
-        # default). AE 2026-verified: ai.ai (CMYK)=0x02, complex.ai (RGB)=0x08.
-        text_color_space=0x02 if color_space == "CMYK" else 0x08,
+        text_document_layers=min(layer_count, 0xFF),
         text_element_count=1,
-        text_layer_reference=True,
+        text_layer_visible=visible,
         text_layer_name=truncate_utf8(layer_name, 255).decode("utf-8"),
         text_page_height=height,
         text_page_width=width,
@@ -757,10 +759,10 @@ class TextOptiChunk(OptiChunk):
     """AI/EPS/PDF footage asset (asset_type='TEXT').
 
     Fixed 596-byte layout (AE 2026). For a layered Illustrator/PDF import
-    each footage item selects its source layer via `text_layer_name` and
-    `text_layer_reference`; whole-document footage (and EPS) leaves them
-    zero. Field defaults reproduce AE's whole-document header, so the
-    `build_*_opti_data` builders only set what differs.
+    each footage item selects its source layer via `text_layer_name`;
+    whole-document footage (and EPS) leaves it empty. Field defaults
+    reproduce AE's whole-document header, so the `build_*_opti_data`
+    builders only set what differs.
     """
 
     asset_type: str = ascii_field(4, default="TEXT")
@@ -782,16 +784,29 @@ class TextOptiChunk(OptiChunk):
     _pad_1e: bytes = bytes_field(10, repr=False)
     _pad_28: bytes = bytes_field(4, default=b"\xff\xff\xff\xff", repr=False)
     _pad_2c: bytes = bytes_field(7, repr=False)
-    text_color_space: int = u1_field()
-    """Document color-space flag: 0x02 = CMYK, 0x08 = RGB/default. Not
-    necessary for whole-document footage, where builders leave 0."""
+    text_document_layers: int = u1_field()
+    """How many layers the source document has (not this binding's index).
+    Zero for whole-document footage, which selects no layer.
+
+    Read as a color-space flag until AE 2026 fixtures with more than eight
+    layers turned up: ai.ai (CMYK) writes 2 and complex.ai (RGB) writes 8,
+    which happen to look like color codes, but ai_bounds_probe.pdf writes 22
+    and std14_probe.pdf 48 - their layer counts."""
 
     _pad_34: bytes = bytes_field(8, repr=False)
     text_element_count: int = u1_field()
     """Element/page count (1 for a per-layer reference)."""
 
-    text_layer_reference: bool = bool_field()
-    """`True` when this opti references a single source layer."""
+    text_layer_visible: bool = bool_field()
+    """The source layer's visibility in the Illustrator/PDF document: `False`
+    for a layer listed in the file's `/OCProperties` `/D` `/OFF` array, which
+    AE also imports with its comp-layer video switch off. Zero for
+    whole-document footage, which has no source layer.
+
+    Not a "references a layer" flag: AE writes 0 here for a hidden layer's
+    footage, which is a layer binding all the same (`text_layer_name` and the
+    `sspc` layer index are both set). Reading it as one made those bindings
+    look like whole-document footage."""
 
     _pad_3e: bytes = bytes_field(6, repr=False)
     text_layer_name: str = str_field(256)

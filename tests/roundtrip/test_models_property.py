@@ -9,6 +9,7 @@ from helpers import (
     get_comp,
     get_first_layer,
     get_layer,
+    parse_project_fresh,
 )
 
 from py_aep import parse as parse_aep
@@ -520,7 +521,15 @@ class TestRoundtripKeyframeEase:
 
 
 class TestValidateKeyframeEaseInfluence:
-    """Validation tests for KeyframeEase.influence bounds (0.1-100.0)."""
+    """Validation tests for KeyframeEase.influence bounds (0.0-100.0).
+
+    The old lower bound of 0.1 was AE's *dialog* minimum, not the field's
+    range. AE itself writes below it: separating a dimension-separated
+    Position stores `1/dt` percent per side, which is 0.0833 for a 12 s
+    segment (measured on AE 2026), and AE's files carry a plain 0.0 on the
+    inert outer side of an endpoint keyframe. Bounding by the UI limit
+    rejected values AE stores.
+    """
 
     def test_influence_rejects_below_min(self) -> None:
         project = parse_aep(SAMPLES_DIR / "keyframe_interpolation.aep").project
@@ -530,7 +539,18 @@ class TestValidateKeyframeEaseInfluence:
         assert prop is not None
         kf = prop.keyframes[0]
         with pytest.raises(ValueError, match="must be"):
-            kf.out_temporal_ease[0].influence = 0.0
+            kf.out_temporal_ease[0].influence = -0.1
+
+    def test_influence_accepts_what_ae_writes_for_a_long_segment(self) -> None:
+        """AE stores 1/12 percent when separating across a 12 s segment."""
+        project = parse_aep(SAMPLES_DIR / "keyframe_interpolation.aep").project
+        comp = get_comp(project, "keyframe_BEZIER")
+        prop = _find_property(comp.layers[0], "ADBE Position")
+        assert prop is not None
+        prop.keyframes[0].out_temporal_ease[0].influence = 1.0 / 12.0
+        assert prop.keyframes[0].out_temporal_ease[0].influence == pytest.approx(
+            1.0 / 12.0
+        )
 
     def test_influence_rejects_above_max(self) -> None:
         project = parse_aep(SAMPLES_DIR / "keyframe_interpolation.aep").project
@@ -2918,3 +2938,141 @@ class TestKeyframeInterpolationTypeGuard:
             setattr(kf, side, 9999)
         with pytest.raises(TypeError):
             setattr(kf, side, "hold")
+
+
+class TestRoundtripAnimatedTdb4Stamps:
+    """Animating a property must stamp the comp-derived tdb4 fields.
+
+    AE writes `cdta.internal_timebase` into every property tdb4 and the comp
+    pixel aspect into spatial ones. The animated-tdb4 template used to
+    hard-code 24576, so animating anything in a non-24 fps comp wrote a 24 fps
+    timebase - the field AE rejects a file over ("zero denominator converting
+    ratio denominators"). Measured on AE 2026.
+    """
+
+    SAMPLE = (
+        Path(__file__).parent.parent.parent
+        / "samples"
+        / "models"
+        / "property"
+        / "effect_point_speed.aep"
+    )
+
+    def test_animate_stamps_comp_timebase(self, tmp_path: Path) -> None:
+        project = parse_project_fresh(self.SAMPLE)
+        comp = project.compositions[0]
+        assert comp.frame_rate == 25.0
+        assert comp._cdta.internal_timebase == 25600
+
+        prop = comp.layers[0].transform["ADBE Scale"]
+        prop.add_key(1.0)
+        out = tmp_path / "modified.aep"
+        project.save(out)
+
+        comp2 = parse_aep(out).project.compositions[0]
+        prop2 = comp2.layers[0].transform["ADBE Scale"]
+        assert prop2.keyframes
+        assert prop2._tdb4._time_base == 25600
+
+    def test_set_value_at_time_stamps_comp_timebase(self, tmp_path: Path) -> None:
+        project = parse_project_fresh(self.SAMPLE)
+        comp = project.compositions[0]
+        prop = comp.layers[0].transform["ADBE Rotate Z"]
+        prop.set_value_at_time(1.0, 45.0)
+        out = tmp_path / "modified.aep"
+        project.save(out)
+
+        comp2 = parse_aep(out).project.compositions[0]
+        prop2 = comp2.layers[0].transform["ADBE Rotate Z"]
+        assert prop2._tdb4._time_base == 25600
+
+    def test_animate_stamps_pixel_aspect_on_spatial(self, tmp_path: Path) -> None:
+        """AE writes the comp pixel aspect into a spatial property tdb4."""
+        project = parse_project_fresh(self.SAMPLE)
+        comp = project.compositions[0]
+        comp.pixel_aspect = 1.5
+
+        comp.layers[0].transform["ADBE Anchor Point"].add_key(1.0)
+        out = tmp_path / "modified.aep"
+        project.save(out)
+
+        comp2 = parse_aep(out).project.compositions[0]
+        anchor = comp2.layers[0].transform["ADBE Anchor Point"]
+        assert anchor.is_spatial
+        assert anchor._tdb4.pixel_aspect == pytest.approx(1.5)
+        assert anchor._tdb4._time_base == 25600
+
+    def test_animate_leaves_pixel_aspect_alone_on_scalar(self, tmp_path: Path) -> None:
+        """Non-spatial properties keep 1.0 even in a non-square-pixel comp -
+        the predicate is narrower than `is_spatial`, so a scalar must not
+        pick the comp aspect up."""
+        project = parse_project_fresh(self.SAMPLE)
+        comp = project.compositions[0]
+        comp.pixel_aspect = 1.5
+
+        comp.layers[0].transform["ADBE Opacity"].add_key(1.0)
+        out = tmp_path / "modified.aep"
+        project.save(out)
+
+        comp2 = parse_aep(out).project.compositions[0]
+        opacity = comp2.layers[0].transform["ADBE Opacity"]
+        assert not opacity.is_spatial
+        assert opacity._tdb4.pixel_aspect == pytest.approx(1.0)
+
+
+class TestExpressionEnabledGuard:
+    """`expression_enabled = True` needs an expression to enable.
+
+    AE silently no-ops this. py-aep raises instead: mirroring the no-op
+    would clear the tdb4 disabled bit for an expression that does not
+    exist - a byte AE never writes, and one the getter then masks behind
+    `bool(self.expression)`, so nothing would surface the mistake.
+    """
+
+    SAMPLE = (
+        Path(__file__).parent.parent.parent
+        / "samples"
+        / "models"
+        / "property"
+        / "keyframe_1D.aep"
+    )
+
+    def test_enabling_without_an_expression_raises(self) -> None:
+        project = parse_project_fresh(self.SAMPLE)
+        prop = project.compositions[0].layers[0].transform["ADBE Opacity"]
+        assert prop.expression == ""
+
+        with pytest.raises(ValueError, match="no expression to enable"):
+            prop.expression_enabled = True
+
+    def test_the_rejected_write_leaves_the_byte_alone(self) -> None:
+        project = parse_project_fresh(self.SAMPLE)
+        prop = project.compositions[0].layers[0].transform["ADBE Opacity"]
+        before = prop._tdb4.expression_disabled
+
+        with pytest.raises(ValueError):
+            prop.expression_enabled = True
+
+        assert prop._tdb4.expression_disabled == before
+
+    def test_enabling_with_an_expression_still_works(self, tmp_path: Path) -> None:
+        project = parse_project_fresh(self.SAMPLE)
+        prop = project.compositions[0].layers[0].transform["ADBE Opacity"]
+        prop.expression = "value * 2"
+        prop.expression_enabled = False
+        prop.expression_enabled = True
+
+        out = tmp_path / "modified.aep"
+        project.save(out)
+        prop2 = (
+            parse_aep(out).project.compositions[0].layers[0].transform["ADBE Opacity"]
+        )
+        assert prop2.expression == "value * 2"
+        assert prop2.expression_enabled is True
+
+    def test_disabling_without_an_expression_is_allowed(self) -> None:
+        """Only enabling is guarded; clearing the flag stays a no-op write."""
+        project = parse_project_fresh(self.SAMPLE)
+        prop = project.compositions[0].layers[0].transform["ADBE Opacity"]
+        prop.expression_enabled = False
+        assert prop.expression_enabled is False

@@ -10,11 +10,13 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-from helpers import get_comp
+from helpers import get_comp, parse_project_fresh
 
 from py_aep import Application
 from py_aep import parse as parse_aep
 from py_aep.binary.chunk import write_aep
+from py_aep.enums import KeyframeInterpolationType
+from py_aep.models.properties.keyframe_ease import KeyframeEase
 from py_aep.models.properties.property import Property
 from py_aep.models.properties.shape import Shape
 
@@ -956,3 +958,408 @@ class TestSpatialFlagGuards:
         kf = _prop(app, "ADBE Opacity").keyframes[0]
         with pytest.raises(ValueError, match="spatial keyframes"):
             kf.spatial_continuous = False
+
+
+class TestRoundtripSubFrameKeyframeTime:
+    """Keyframe.time is exact, not snapped to whole frames.
+
+    AE places keyframes off the frame grid freely: `setValueAtTime(1.5)` in a
+    25 fps comp is stored as 38400 units, i.e. frame 37.5, and every roving
+    keyframe is positioned by arc length. Rounding to frames misreported such
+    a keyframe by up to half a frame and moved it on the next write.
+    """
+
+    SAMPLE = (
+        Path(__file__).parent.parent.parent
+        / "samples"
+        / "models"
+        / "property"
+        / "effect_point_speed.aep"
+    )
+
+    def test_off_grid_time_is_exact(self, tmp_path: Path) -> None:
+        """1.5 s in a 25 fps comp is frame 37.5. Before the fix this read
+        back as 1.52."""
+        project = parse_project_fresh(self.SAMPLE)
+        comp = project.compositions[0]
+        assert comp.frame_rate == 25.0
+        prop = comp.layers[0].transform["ADBE Opacity"]
+        prop.add_key(1.5)
+
+        keyframe = next(k for k in prop.keyframes if k.time_units == 38400)
+        assert keyframe.time == pytest.approx(1.5)
+
+        out = tmp_path / "modified.aep"
+        project.save(out)
+        comp2 = parse_aep(out).project.compositions[0]
+        prop2 = comp2.layers[0].transform["ADBE Opacity"]
+        keyframe2 = next(k for k in prop2.keyframes if k.time_units == 38400)
+        assert keyframe2.time == pytest.approx(1.5)
+
+    def test_rewriting_its_own_time_does_not_move_a_keyframe(self) -> None:
+        """`kf.time = kf.time` used to snap an off-grid keyframe to the
+        nearest frame."""
+        project = parse_project_fresh(self.SAMPLE)
+        prop = project.compositions[0].layers[0].transform["ADBE Opacity"]
+        prop.add_key(1.5)
+        keyframe = next(k for k in prop.keyframes if k.time_units == 38400)
+
+        keyframe.time = keyframe.time
+
+        assert keyframe.time_units == 38400
+
+    def test_two_keyframes_can_share_a_frame(self) -> None:
+        """Sub-frame keyframes inside one frame are distinct, so the
+        duplicate-time guard must compare units and not frame indices."""
+        project = parse_project_fresh(self.SAMPLE)
+        prop = project.compositions[0].layers[0].transform["ADBE Opacity"]
+        # Both round to frame 37 at 25 fps (37.025 and 37.375) while
+        # occupying different timebase units.
+        prop.add_key(1.481)
+        prop.add_key(1.495)
+
+        units = sorted(k.time_units for k in prop.keyframes)
+        assert len(set(units)) == len(units)
+        inside = [k for k in prop.keyframes if k.frame_time == 37]
+        assert len(inside) == 2
+
+    def test_frame_time_still_rounds(self) -> None:
+        project = parse_project_fresh(self.SAMPLE)
+        prop = project.compositions[0].layers[0].transform["ADBE Opacity"]
+        prop.add_key(1.5)
+        keyframe = next(k for k in prop.keyframes if k.time_units == 38400)
+        assert keyframe.frame_time == 38
+        assert keyframe.time == pytest.approx(1.5)
+
+    def test_layer_start_offset_stays_in_seconds(self, tmp_path: Path) -> None:
+        """Keyframe times are stored relative to the layer start; an
+        off-grid start must not quantize the keyframe."""
+        project = parse_project_fresh(self.SAMPLE)
+        comp = project.compositions[0]
+        layer = comp.layers[0]
+        layer.start_time = 0.29166666666666663  # 7/24 s, off the 25 fps grid
+        prop = layer.transform["ADBE Opacity"]
+        prop.add_key(2.0)
+
+        out = tmp_path / "modified.aep"
+        project.save(out)
+        comp2 = parse_aep(out).project.compositions[0]
+        prop2 = comp2.layers[0].transform["ADBE Opacity"]
+        # Times are an integer count of timebase units, so a request that
+        # falls between units lands on the nearest one - AE requantizes
+        # identically (it stored 0.99998697916667 for a 1.0 s request on a
+        # layer with this start).
+        half_unit = 0.5 / comp2._cdta.internal_timebase
+        assert any(abs(k.time - 2.0) <= half_unit for k in prop2.keyframes)
+
+
+class TestRoundtripRoving:
+    """Roving keyframes are positioned by arc length, not stored freely.
+
+    AE derives a roving keyframe's time so the speed along the spatial path
+    is constant between the enclosing non-roving anchors, and applies it the
+    moment the flag is set. Both expected times below are AE 2026
+    measurements on a 25 fps comp with the first segment bowed by +/-400 px
+    tangents - a case where chord length would predict 0.667 s.
+    """
+
+    SAMPLE = (
+        Path(__file__).parent.parent.parent
+        / "samples"
+        / "models"
+        / "property"
+        / "effect_point_speed.aep"
+    )
+
+    def _bowed_path(self, bow: float) -> Property:
+        project = parse_project_fresh(self.SAMPLE)
+        comp = project.compositions[0]
+        assert comp.frame_rate == 25.0
+        prop = comp.layers[0].transform["ADBE Position"]
+        while prop.keyframes:
+            prop.remove_key(0)
+        for time, value in ((0.0, 0.0), (1.0, 100.0), (4.0, 600.0)):
+            prop.add_key(time)
+            prop.keyframes[-1].value = [value, 200.0, 0.0]
+        for keyframe in prop.keyframes:
+            keyframe.in_interpolation_type = KeyframeInterpolationType.BEZIER
+            keyframe.out_interpolation_type = KeyframeInterpolationType.BEZIER
+        prop.keyframes[0].out_spatial_tangent = [0.0, bow, 0.0]
+        prop.keyframes[1].in_spatial_tangent = [0.0, bow, 0.0]
+        return prop
+
+    def test_roving_uses_arc_length_not_chord(self) -> None:
+        """AE put the roving key at 2.2205078125 s (56845 units). The chord
+        between the same keyframes would put it at 0.667 s."""
+        prop = self._bowed_path(400.0)
+        assert prop.keyframes[1].time == 1.0
+
+        prop.keyframes[1].roving = True
+
+        assert prop.keyframes[1].time_units == 56845
+        assert prop.keyframes[1].time == pytest.approx(2.2205078125)
+
+    def test_flattening_the_path_moves_the_roving_key(self) -> None:
+        """A shallower bow shortens the first segment, so AE pulls the key
+        back to 0.819296875 s (20974 units)."""
+        prop = self._bowed_path(40.0)
+        prop.keyframes[1].roving = True
+        assert prop.keyframes[1].time_units == 20974
+        assert prop.keyframes[1].time == pytest.approx(0.819296875)
+
+    def test_roving_survives_a_save(self, tmp_path: Path) -> None:
+        project = parse_project_fresh(self.SAMPLE)
+        comp = project.compositions[0]
+        prop = comp.layers[0].transform["ADBE Position"]
+        while prop.keyframes:
+            prop.remove_key(0)
+        for time, value in ((0.0, 0.0), (1.0, 100.0), (4.0, 600.0)):
+            prop.add_key(time)
+            prop.keyframes[-1].value = [value, 200.0, 0.0]
+        prop.keyframes[1].roving = True
+        moved = prop.keyframes[1].time_units
+
+        out = tmp_path / "modified.aep"
+        project.save(out)
+        prop2 = (
+            parse_aep(out).project.compositions[0].layers[0].transform["ADBE Position"]
+        )
+        assert prop2.keyframes[1].roving is True
+        assert prop2.keyframes[1].time_units == moved
+
+    def test_unroving_keeps_the_redistributed_time(self) -> None:
+        """AE does not restore the original time: the redistribution already
+        happened, and turning the flag off leaves the key where it moved to."""
+        prop = self._bowed_path(400.0)
+        prop.keyframes[1].roving = True
+        moved = prop.keyframes[1].time_units
+
+        prop.keyframes[1].roving = False
+
+        assert prop.keyframes[1].roving is False
+        assert prop.keyframes[1].time_units == moved
+
+    def test_non_spatial_property_is_rejected(self) -> None:
+        """AE raises here: "This property does not have a spatial
+        PropertyValueType"."""
+        project = parse_project_fresh(
+            Path(__file__).parent.parent.parent
+            / "samples"
+            / "models"
+            / "property"
+            / "keyframe_misc.aep"
+        )
+        prop = project.compositions[0].layers[0].transform["ADBE Scale"]
+        assert not prop.is_spatial
+        with pytest.raises(ValueError, match="spatial property"):
+            prop.keyframes[1].roving = True
+
+    @pytest.mark.parametrize("index", [0, -1])
+    def test_first_and_last_keyframe_are_rejected(self, index: int) -> None:
+        """AE silently no-ops these; py-aep raises so the caller sees it."""
+        prop = self._bowed_path(400.0)
+        with pytest.raises(ValueError, match="cannot rove"):
+            prop.keyframes[index].roving = True
+
+
+class TestRoundtripAutoBezierWrites:
+    """The auto-bezier and continuity flags carry companion state.
+
+    AE rewrites the derived values and forces companion flags when these are
+    set, and - critically - it TRUSTS the stored bytes if the keyframe is
+    later switched back to BEZIER: a stale 90% influence written under HOLD
+    came back as 90 on the way out. So the bytes have to agree with the
+    reader, not merely the reported values. All expectations are AE 2026
+    measurements.
+    """
+
+    PROPERTY_DIR = (
+        Path(__file__).parent.parent.parent / "samples" / "models" / "property"
+    )
+
+    def _uneven_position(self) -> Property:
+        """t = 0 / 1 / 4 with x = 0 / 100 / 600 - uneven in time, so a
+        time-weighted tangent rule would disagree with AE's chord/6."""
+        project = parse_project_fresh(self.PROPERTY_DIR / "effect_point_speed.aep")
+        prop = project.compositions[0].layers[0].transform["ADBE Position"]
+        while prop.keyframes:
+            prop.remove_key(0)
+        for time, x in ((0.0, 0.0), (1.0, 100.0), (4.0, 600.0)):
+            prop.add_key(time)
+            prop.keyframes[-1].value = [x, 0.0, 0.0]
+        for keyframe in prop.keyframes:
+            keyframe.in_interpolation_type = KeyframeInterpolationType.BEZIER
+            keyframe.out_interpolation_type = KeyframeInterpolationType.BEZIER
+        return prop
+
+    def test_spatial_auto_bezier_writes_the_derived_tangents(self) -> None:
+        prop = self._uneven_position()
+        keyframe = prop.keyframes[1]
+        keyframe.in_spatial_tangent = [-40.0, -10.0, 0.0]
+        keyframe.out_spatial_tangent = [70.0, 25.0, 0.0]
+        stored = keyframe._ldat_item.kf_data
+
+        keyframe.spatial_auto_bezier = True
+
+        assert list(stored.out_spatial_tangents) == pytest.approx([100.0, 0.0, 0.0])
+        assert list(stored.in_spatial_tangents) == pytest.approx([-100.0, 0.0, 0.0])
+
+    def test_spatial_auto_bezier_forces_continuity(self) -> None:
+        prop = self._uneven_position()
+        keyframe = prop.keyframes[1]
+        keyframe.spatial_continuous = False
+
+        keyframe.spatial_auto_bezier = True
+
+        assert keyframe.spatial_continuous is True
+
+    def test_clearing_spatial_auto_bezier_keeps_the_derived_tangents(self) -> None:
+        """AE does not restore what was there before."""
+        prop = self._uneven_position()
+        keyframe = prop.keyframes[1]
+        keyframe.spatial_auto_bezier = True
+        keyframe.spatial_auto_bezier = False
+        stored = keyframe._ldat_item.kf_data
+        assert list(stored.out_spatial_tangents) == pytest.approx([100.0, 0.0, 0.0])
+
+    def test_temporal_auto_bezier_is_per_dimension(self, tmp_path: Path) -> None:
+        """2-D Scale 100->200->400 and 100->120->150 over 2 s gives per
+        dimension speeds 150 and 25, not one shared scalar."""
+        project = parse_project_fresh(self.PROPERTY_DIR / "keyframe_misc.aep")
+        prop = project.compositions[0].layers[0].transform["ADBE Scale"]
+        while prop.keyframes:
+            prop.remove_key(0)
+        for time, value in (
+            (0.0, [100.0, 100.0, 100.0]),
+            (1.0, [200.0, 120.0, 100.0]),
+            (2.0, [400.0, 150.0, 100.0]),
+        ):
+            prop.add_key(time)
+            prop.keyframes[-1].value = value
+        for keyframe in prop.keyframes:
+            keyframe.in_interpolation_type = KeyframeInterpolationType.BEZIER
+            keyframe.out_interpolation_type = KeyframeInterpolationType.BEZIER
+
+        prop.keyframes[1].temporal_auto_bezier = True
+
+        out = tmp_path / "modified.aep"
+        project.save(out)
+        prop2 = parse_aep(out).project.compositions[0].layers[0].transform["ADBE Scale"]
+        speeds = [ease.speed for ease in prop2.keyframes[1].in_temporal_ease]
+        assert speeds == pytest.approx([150.0, 25.0, 0.0])
+        influences = [ease.influence for ease in prop2.keyframes[1].in_temporal_ease]
+        assert influences == pytest.approx([100.0 / 6.0] * 3)
+
+    def test_temporal_auto_bezier_forces_continuity_and_bezier(self) -> None:
+        prop = self._uneven_position()
+        keyframe = prop.keyframes[1]
+        keyframe.in_interpolation_type = KeyframeInterpolationType.LINEAR
+        keyframe.out_interpolation_type = KeyframeInterpolationType.LINEAR
+        keyframe.temporal_continuous = False
+
+        keyframe.temporal_auto_bezier = True
+
+        assert keyframe.temporal_continuous is True
+        assert keyframe.in_interpolation_type == KeyframeInterpolationType.BEZIER
+        assert keyframe.out_interpolation_type == KeyframeInterpolationType.BEZIER
+
+    def test_temporal_continuous_ties_the_out_speed_to_the_in_speed(self) -> None:
+        """AE turns (10, 75) / (90, 25) into (10, 75) / (10, 25): the speeds
+        are tied, both influences survive."""
+        project = parse_project_fresh(
+            self.PROPERTY_DIR / "keyframe_bezier_nonzero_speed.aep"
+        )
+        prop = next(
+            g
+            for layer in project.compositions[0].layers
+            for g in layer.transform.properties
+            if g.keyframes and g.match_name == "ADBE Opacity"
+        )
+        keyframe = prop.keyframes[0]
+        in_speed = keyframe.in_temporal_ease[0].speed
+        out_influence = keyframe.out_temporal_ease[0].influence
+        assert keyframe.out_temporal_ease[0].speed != in_speed
+
+        keyframe.temporal_continuous = True
+
+        assert keyframe.out_temporal_ease[0].speed == pytest.approx(in_speed)
+        assert keyframe.out_temporal_ease[0].influence == pytest.approx(out_influence)
+
+    def test_temporal_continuous_forces_bezier_and_uses_the_stored_speed(
+        self,
+    ) -> None:
+        """AE 2026 (`scripts/jsx/temporal_continuous_probe.jsx`): setting
+        temporal continuity rewrites BOTH interpolation types to BEZIER
+        first, in all five in/out pairings tried. That is what makes the
+        STORED in speed the one to copy - a LINEAR side reports the segment
+        slope (100 on this ramp) but AE gives back the stored 10.
+        """
+        prop = self._uneven_position()
+        keyframe = prop.keyframes[1]
+        keyframe.in_temporal_ease = [KeyframeEase(speed=10.0, influence=75.0)]
+        keyframe.out_temporal_ease = [KeyframeEase(speed=90.0, influence=25.0)]
+        keyframe.in_interpolation_type = KeyframeInterpolationType.LINEAR
+        # The LINEAR side reports the segment slope, not the stored 10.
+        assert keyframe.in_temporal_ease[0].speed == pytest.approx(100.0)
+
+        keyframe.temporal_continuous = True
+
+        assert keyframe.in_interpolation_type == KeyframeInterpolationType.BEZIER
+        assert keyframe.out_interpolation_type == KeyframeInterpolationType.BEZIER
+        assert keyframe.in_temporal_ease[0].speed == pytest.approx(10.0)
+        assert keyframe.in_temporal_ease[0].influence == pytest.approx(75.0)
+        assert keyframe.out_temporal_ease[0].speed == pytest.approx(10.0)
+        assert keyframe.out_temporal_ease[0].influence == pytest.approx(25.0)
+
+    @pytest.mark.parametrize(
+        "interpolation",
+        [KeyframeInterpolationType.HOLD, KeyframeInterpolationType.LINEAR],
+    )
+    def test_interpolation_change_preserves_the_stored_ease(
+        self, interpolation: KeyframeInterpolationType, tmp_path: Path
+    ) -> None:
+        """Changing the interpolation type must NOT rewrite the ease bytes.
+
+        AE 2026 (`scripts/jsx/interpolation_ease_probe.jsx`): a keyframe
+        eased (10, 75) / (90, 25) under BEZIER and then switched to LINEAR
+        or HOLD keeps those bytes on disk - only the REPORTED ease changes,
+        to the segment slope (LINEAR) or zero (HOLD). Switching back to
+        BEZIER hands 10 / 75 and 90 / 25 straight back, and a keyframe that
+        never carried an ease reports the stored `(0, 0)` under BEZIER
+        rather than anything derived. Normalizing the bytes here wrote
+        numbers AE never writes and destroyed the ease it gives back.
+        """
+        project = parse_project_fresh(
+            self.PROPERTY_DIR / "keyframe_bezier_asymmetric_ease_1D.aep"
+        )
+        prop = next(
+            g
+            for layer in project.compositions[0].layers
+            for g in layer.transform.properties
+            if g.keyframes
+        )
+        keyframe = prop.keyframes[0]
+        stored = keyframe._ldat_item.kf_data
+        before = list(stored.in_influence), list(stored.out_influence)
+        assert before[1] == pytest.approx([0.9])
+
+        keyframe.in_interpolation_type = interpolation
+        keyframe.out_interpolation_type = interpolation
+
+        assert list(stored.in_influence) == pytest.approx(before[0])
+        assert list(stored.out_influence) == pytest.approx(before[1])
+
+        keyframe.in_interpolation_type = KeyframeInterpolationType.BEZIER
+        keyframe.out_interpolation_type = KeyframeInterpolationType.BEZIER
+        assert keyframe.out_temporal_ease[0].influence == pytest.approx(90.0)
+
+        out = tmp_path / "modified.aep"
+        project.save(out)
+        prop2 = next(
+            g
+            for layer in parse_aep(out).project.compositions[0].layers
+            for g in layer.transform.properties
+            if g.keyframes
+        )
+        reloaded = prop2.keyframes[0]._ldat_item.kf_data
+        assert list(reloaded.out_influence) == pytest.approx(before[1])
