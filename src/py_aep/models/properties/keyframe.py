@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, cast
 from py_aep.enums import KeyframeInterpolationType, Label
 
 from ...resolvers.interpolation import (
+    _DEFAULT_INFLUENCE,
     auto_spatial_tangents,
     auto_temporal_speeds,
     roving_keyframe_times,
@@ -29,8 +30,6 @@ if TYPE_CHECKING:
         list[float], float, Gradient, MarkerValue, Shape, TextDocument, None
     ]
 
-
-_DEFAULT_INFLUENCE = 100.0 / 6.0
 
 _VALUE_FROM_CHUNK = object()  # sentinel: read value from _ldat_item
 
@@ -82,7 +81,7 @@ def _validate_roving(value: bool, keyframe: Keyframe) -> None:
     prop = keyframe._property
     if prop is None:
         return
-    if not prop.is_spatial:
+    if not prop._has_motion_path:
         raise ValueError(
             f"roving can only be set on a spatial property, not {prop.match_name!r}"
         )
@@ -256,10 +255,10 @@ class Keyframe:
         if speeds is None:
             return
         self._ensure_ease()
-        for direction, values in (("in", speeds[0]), ("out", speeds[1])):
-            backing = (
-                self._in_temporal_ease if direction == "in" else self._out_temporal_ease
-            )
+        for direction, values, backing in (
+            ("in", speeds[0], self._in_temporal_ease),
+            ("out", speeds[1], self._out_temporal_ease),
+        ):
             if backing is None or len(backing) != len(values):
                 continue
             self._apply_ease(
@@ -304,17 +303,9 @@ class Keyframe:
         `invert` divides instead, for the write path.
         """
         prop = self._property
-        scale = prop._effect_scale if prop is not None else None
-        if scale is None:
+        if prop is None:
             return list(tangent)
-        result = []
-        for index, component in enumerate(tangent):
-            factor = scale[index] if index < len(scale) else None
-            if factor is None or (invert and not factor):
-                result.append(component)
-            else:
-                result.append(component / factor if invert else component * factor)
-        return result
+        return prop._apply_effect_scale(tangent, invert=invert)
 
     def _bind_property(self, prop: Property) -> None:
         """Set the owning property and propagate speed factor to ease."""
@@ -444,6 +435,16 @@ class Keyframe:
         if value is not None and hasattr(kf_data, "out_spatial_tangents"):
             kf_data.out_spatial_tangents = self._rescale_tangent(value, invert=True)
 
+    def _neighbour_window(self) -> tuple[list[Keyframe], int]:
+        """This keyframe plus its immediate neighbours, and its own index.
+
+        One to three keyframes. The interpolation resolvers clamp at the
+        ends themselves, so a boundary keyframe simply yields a shorter
+        window rather than a special case here.
+        """
+        window = [kf for kf in (self._prev, self, self._next) if kf is not None]
+        return window, 1 if self._prev is not None else 0
+
     def _auto_spatial_tangents(self) -> tuple[list[float], list[float]] | None:
         """AE's derived tangents for a spatial auto-bezier keyframe.
 
@@ -455,28 +456,10 @@ class Keyframe:
         Derived in the raw chunk space, matching what these accessors
         return. Returns `None` when the keyframe carries no spatial data.
         """
-        kf_data = self._ldat_item.kf_data
-        if not hasattr(kf_data, "in_spatial_tangents"):
+        if not hasattr(self._ldat_item.kf_data, "in_spatial_tangents"):
             return None
-        current = list(kf_data.value)
-        previous, following = self._prev, self._next
-        if previous is None and following is None:
-            zero = [0.0] * len(current)
-            return zero, list(zero)
-        if previous is None:
-            assert following is not None
-            values = [current, list(following._ldat_item.kf_data.value)]
-            index = 0
-        elif following is None:
-            values = [list(previous._ldat_item.kf_data.value), current]
-            index = 1
-        else:
-            values = [
-                list(previous._ldat_item.kf_data.value),
-                current,
-                list(following._ldat_item.kf_data.value),
-            ]
-            index = 1
+        window, index = self._neighbour_window()
+        values = [list(kf._ldat_item.kf_data.value) for kf in window]
         return auto_spatial_tangents(values, index)
 
     def _auto_temporal_speeds(self) -> tuple[list[float], list[float]] | None:
@@ -497,34 +480,12 @@ class Keyframe:
                 return [float(component) for component in value]
             return None
 
-        current = as_vector(self)
-        if current is None:
+        window, index = self._neighbour_window()
+        values = [as_vector(kf) for kf in window]
+        if any(value is None for value in values):
             return None
-        previous, following = self._prev, self._next
-        if previous is None and following is None:
-            zero = [0.0] * len(current)
-            return zero, list(zero)
-        if previous is None:
-            assert following is not None
-            neighbour = as_vector(following)
-            if neighbour is None:
-                return None
-            return auto_temporal_speeds(
-                [current, neighbour], [self.time, following.time], 0
-            )
-        if following is None:
-            neighbour = as_vector(previous)
-            if neighbour is None:
-                return None
-            return auto_temporal_speeds(
-                [neighbour, current], [previous.time, self.time], 1
-            )
-        low, high = as_vector(previous), as_vector(following)
-        if low is None or high is None:
-            return None
-        return auto_temporal_speeds(
-            [low, current, high], [previous.time, self.time, following.time], 1
-        )
+        times = [kf.time for kf in window]
+        return auto_temporal_speeds(cast("list[list[float]]", values), times, index)
 
     @property
     def value(
@@ -798,7 +759,7 @@ class Keyframe:
             speeds = _segment_speed(
                 self if direction == "out" else other,
                 other if direction == "out" else self,
-                self._property.is_spatial if self._property else False,
+                self._property._has_motion_path if self._property else False,
             )
             return [KeyframeEase(speed=s, influence=_DEFAULT_INFLUENCE) for s in speeds]
 
@@ -880,7 +841,18 @@ class Keyframe:
 
     @property
     def _timebase(self) -> float:
-        """Keyframe units per second, from this keyframe's cached rates."""
+        """Keyframe units per second, in the owning LAYER's own time.
+
+        A time-stretched layer counts its ticks against a stretched base
+        (`cdta.internal_timebase * max(1, |stretch| / 100)`), so the comp's
+        own base only applies at 100 %. Falls back to the cached comp rates
+        when the keyframe has no property yet (construction).
+        """
+        prop = self._property
+        if prop is not None:
+            base = prop._layer_timebase
+            if base:
+                return base
         return _timebase_units(self._time_scale, self._frame_rate)
 
     @property
@@ -943,7 +915,9 @@ class Keyframe:
         seconds = self._ldat_item.time_units / self._timebase
         prop = self._property
         if prop is not None:
-            seconds += prop._start_time_offset
+            # Ticks are layer time; a stretched layer maps them onto the
+            # composition timeline by its stretch factor.
+            seconds = seconds * prop._time_stretch + prop._start_time_offset
         return seconds
 
     @time.setter
@@ -951,7 +925,8 @@ class Keyframe:
         validate_number(value)
         prop = self._property
         offset = prop._start_time_offset if prop is not None else 0.0
-        self._set_time_units(round((value - offset) * self._timebase))
+        stretch = prop._time_stretch if prop is not None else 1.0
+        self._set_time_units(round((value - offset) / stretch * self._timebase))
 
 
 def _segment_speed(
