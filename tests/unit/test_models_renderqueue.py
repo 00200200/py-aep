@@ -33,6 +33,16 @@ OCS_SAMPLES_DIR = (
 )
 
 
+def test_output_module_preserves_noncanonical_true_byte() -> None:
+    raw = bytearray(OutputModuleSettingsItem().tobytes())
+    raw[47] = 0x03
+
+    settings = OutputModuleSettingsItem.frombytes(bytes(raw))
+
+    assert settings.include_project_link is True
+    assert settings.tobytes() == raw
+
+
 class TestResolveOutputFilename:
     """Unit tests for resolve_output_filename()."""
 
