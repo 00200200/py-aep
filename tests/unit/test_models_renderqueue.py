@@ -43,6 +43,17 @@ def test_output_module_preserves_noncanonical_true_byte() -> None:
     assert settings.tobytes() == raw
 
 
+def test_output_module_template_copy_preserves_include_project_link_byte() -> None:
+    source = OutputModuleSettingsItem()
+    source._include_project_link = 0x03
+    target = OutputModuleSettingsItem()
+    target._include_project_link = 0x00
+
+    target.copy_settings_from(source)
+
+    assert target._include_project_link == 0x03
+
+
 class TestResolveOutputFilename:
     """Unit tests for resolve_output_filename()."""
 

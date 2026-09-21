@@ -577,7 +577,7 @@ class OutputModuleSettingsItem(FmtItem):
         "_reserved_24",
         "output_audio",
         "_reserved_26",
-        "include_project_link",
+        "_include_project_link",
         "post_render_action",
         "_reserved_30",
         "output_profile_id",
